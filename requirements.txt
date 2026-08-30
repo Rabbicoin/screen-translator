@@ -1,0 +1,11 @@
+# Библиотеки для запуска из исходников:  pip install -r requirements.txt
+# Отдельно нужен Tesseract OCR — он не библиотека Python, ставится программой
+# с https://github.com/UB-Mannheim/tesseract/wiki
+pillow>=10.0
+pytesseract>=0.3.10
+requests>=2.31
+pystray>=0.19
+pynput>=1.7
+
+# Только для сборки .exe (build.py), для работы программы не нужен:
+# pyinstaller>=6.0

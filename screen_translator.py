@@ -19,7 +19,9 @@ import json
 import os
 import queue
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -52,9 +54,57 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageGra
 import pytesseract
 from pytesseract import Output
 
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-GLOSSARY_PATH = os.path.join(APP_DIR, "glossary.json")
+# Собранная программа (.exe) держит код внутри служебной папки, поэтому
+# __file__ там ведёт не туда, где лежат файлы для человека — рядом с .exe.
+FROZEN = getattr(sys, "frozen", False)
+APP_DIR = (os.path.dirname(os.path.abspath(sys.executable)) if FROZEN
+           else os.path.dirname(os.path.abspath(__file__)))
+
+# Запасной латинский путь: у Tesseract беда с кириллицей, а имя пользователя в
+# Windows вполне может быть русским. Папка «Общие» лежит по адресу
+# C:\Users\Public при любом языке системы.
+PUBLIC_DIR = os.path.join(os.environ.get("PUBLIC") or r"C:\Users\Public",
+                          "ScreenTranslator")
+
+
+def _is_writable(path):
+    probe = os.path.join(path, ".write_test")
+    try:
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+# Настройки, словарь и кэши программа перезаписывает сама. Обычно они лежат
+# рядом с ней — так их проще найти и поправить. Но программу могут положить в
+# Program Files, куда без администратора не записать; тогда уходим в профиль.
+DATA_DIR = APP_DIR if _is_writable(APP_DIR) else os.path.join(
+    os.environ.get("APPDATA") or os.path.expanduser("~"), "ScreenTranslator")
+if DATA_DIR != APP_DIR:
+    try:
+        os.makedirs(DATA_DIR, exist_ok=True)
+    except OSError:
+        DATA_DIR = APP_DIR
+
+
+def data_file(name):
+    """Путь к файлу, который программа правит. Образец из комплекта переносим."""
+    path = os.path.join(DATA_DIR, name)
+    if DATA_DIR != APP_DIR and not os.path.exists(path):
+        shipped = os.path.join(APP_DIR, name)
+        if os.path.isfile(shipped):
+            try:
+                shutil.copyfile(shipped, path)
+            except OSError:
+                pass
+    return path
+
+
+CONFIG_PATH = data_file("config.json")
+GLOSSARY_PATH = data_file("glossary.json")
 DEBUG = os.environ.get("ST_DEBUG") == "1"
 
 
@@ -74,7 +124,10 @@ DEFAULT_CONFIG = {
     "ocr_scale": 2.0,
     "tesseract_psm": 3,
     "theme": "auto",            # "auto" — как в Windows; "dark"; "light"
-    "promo_url": "",            # адрес файла с объявлением; пусто — ничего не показываем
+    # Единственный канал до людей, которым архив уже отдан: текст лежит на
+    # сайте, программа спрашивает его раз в сутки. Очистить — и она не ходит
+    # никуда, кроме сервиса перевода.
+    "promo_url": "https://sevdev.ru/screen-translator/promo.json",
     "promo_hours": 24,          # как часто его перечитывать
     "display_mode": "overlay",   # "overlay" — поверх области, "panel" — окном с текстом
     "auto_copy": True,
@@ -149,9 +202,10 @@ def _clamp(value, low, high, fallback):
 #  Tesseract
 # --------------------------------------------------------------------------------------
 def setup_tesseract():
-    """Ищем tesseract.exe: сначала из конфига, потом стандартные места, потом PATH."""
+    """Ищем tesseract.exe: свой из комплекта, потом из конфига и системные."""
     candidates = [
         CFG.get("tesseract_path") or "",
+        os.path.join(APP_DIR, "tesseract", "tesseract.exe"),
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\Tesseract-OCR\tesseract.exe"),
@@ -176,19 +230,95 @@ TESSERACT_CMD = setup_tesseract()
 #      перенаправляется в их контейнер, и папку не видят ни Проводник, ни
 #      программа, запущенная обычным способом.
 # Отсюда основное место — папка в корне профиля пользователя.
+# Последняя в списке — папка из комплекта собранной программы: языки, которые
+# человек доставил себе сам, должны иметь возможность её перекрыть.
 TESSDATA_DIRS = [
     os.path.join(os.environ.get("USERPROFILE", ""), "ScreenTranslator", "tessdata"),
     os.path.join(os.environ.get("LOCALAPPDATA", ""), "ScreenTranslator", "tessdata"),
     os.path.join(APP_DIR, "tessdata"),
+    os.path.join(APP_DIR, "tesseract", "tessdata"),
 ]
+
+
+def short_path(path):
+    r"""Короткое (8.3) имя пути — оно всегда латиницей.
+
+    Способ показать Tesseract-у папку, до которой иначе не достучаться: путь
+    вида C:\Users\Вася\... превращается в C:\Users\VASYA~1\... Работает не
+    везде — короткие имена в системе можно отключить, тогда вернётся исходный
+    путь и в дело пойдёт копия из _mirror_tessdata.
+    """
+    if not path or path.isascii() or sys.platform != "win32":
+        return path
+    try:
+        buf = ctypes.create_unicode_buffer(32768)
+        if ctypes.windll.kernel32.GetShortPathNameW(path, buf, len(buf)) and buf.value:
+            return buf.value
+    except Exception:
+        pass
+    return path
+
+
+def _mirror_tessdata(src):
+    """Копия языков по латинскому пути — когда короткого имени не досталось.
+
+    Случай редкий (кириллица в пути и отключённые короткие имена), но без копии
+    распознавание не заработает вовсе, а 80 МБ копируются один раз.
+    """
+    dst = os.path.join(PUBLIC_DIR, "tessdata")
+    if not dst.isascii():
+        return None
+    try:
+        os.makedirs(dst, exist_ok=True)
+        for name in glob.glob(os.path.join(src, "*.traineddata")):
+            target = os.path.join(dst, os.path.basename(name))
+            if (not os.path.exists(target)
+                    or os.path.getsize(target) != os.path.getsize(name)):
+                shutil.copyfile(name, target)
+    except OSError as e:
+        print("не удалось скопировать языки распознавания:", e)
+        return None
+    return dst if glob.glob(os.path.join(dst, "*.traineddata")) else None
 
 
 def local_tessdata():
     """Наша папка с языками, если она есть и пригодна. Иначе None — системные."""
     for path in TESSDATA_DIRS:
-        if path and path.isascii() and glob.glob(os.path.join(path, "*.traineddata")):
-            return path
+        if not path or not glob.glob(os.path.join(path, "*.traineddata")):
+            continue
+        usable = short_path(path)
+        if usable.isascii():
+            return usable
+        mirrored = _mirror_tessdata(path)
+        if mirrored:
+            return mirrored
     return None
+
+
+def setup_temp_dir():
+    """Временные файлы — тоже по латинскому пути.
+
+    pytesseract сохраняет снимок во временную папку и передаёт Tesseract-у путь
+    к нему. У пользователя с русским именем учётной записи путь получается с
+    кириллицей, и снимок не открывается — распознавание падает на ровном месте.
+    """
+    current = tempfile.gettempdir()
+    if current.isascii():
+        return current
+    short = short_path(current)
+    if short.isascii():
+        tempfile.tempdir = short
+        return short
+    spare = os.path.join(PUBLIC_DIR, "tmp")
+    try:
+        os.makedirs(spare, exist_ok=True)
+    except OSError:
+        return current
+    tempfile.tempdir = spare
+    return spare
+
+
+TEMP_DIR = setup_temp_dir()
 
 
 def setup_tessdata():
@@ -361,7 +491,7 @@ _promo = {"data": None, "checked": 0.0}
 
 
 def _promo_path():
-    return os.path.join(APP_DIR, "promo_cache.json")
+    return data_file("promo_cache.json")
 
 
 def promo_line():
@@ -552,7 +682,7 @@ def ui_lang():
 
 def _ui_path(lang):
     safe = re.sub(r"[^a-z0-9_-]", "", lang)
-    return os.path.join(APP_DIR, f"ui_{safe}.json")
+    return data_file(f"ui_{safe}.json")
 
 
 def tr(key):
@@ -619,6 +749,11 @@ def fetch_ui_language(lang, done=None):
     threading.Thread(target=work, daemon=True).start()
 
 
+# Языки, которых нет в списках выбора, даже если распознавание их умеет.
+# Меню «Язык на экране» строится по установленным файлам *.traineddata, так что
+# одним удалением названия его оттуда не убрать — нужен явный список.
+HIDDEN_OCR_LANGS = {"ukr"}
+
 # Названия для меню в трее. Коды Tesseract человеку ничего не говорят.
 LANG_NAMES = {
     "eng": "английский", "rus": "русский", "deu": "немецкий", "fra": "французский",
@@ -647,8 +782,8 @@ LANG_NAMES = {
 TARGET_LANGS = [
     ("ru", "Русский"), ("en", "English"), ("de", "Deutsch"),
     ("fr", "Français"), ("es", "Español"), ("it", "Italiano"),
-    ("pt", "Português"), ("pl", "Polski"), ("uk", "Українська"),
-    ("nl", "Nederlands"), ("cs", "Čeština"), ("sv", "Svenska"),
+    ("pt", "Português"), ("pl", "Polski"), ("nl", "Nederlands"),
+    ("cs", "Čeština"), ("sv", "Svenska"),
     ("tr", "Türkçe"), ("ar", "العربية"), ("he", "עברית"),
     ("zh-CN", "中文"), ("ja", "日本語"), ("ko", "한국어"),
     ("hi", "हिन्दी"), ("id", "Bahasa Indonesia"), ("vi", "Tiếng Việt"),
@@ -761,7 +896,10 @@ RUN_NAME = "ScreenTranslator"
 
 
 def autostart_command():
-    """Команда запуска: pythonw — чтобы не мелькало окно консоли."""
+    """Команда запуска. У собранной программы это она сама, у исходника —
+    pythonw, чтобы не мелькало окно консоли."""
+    if FROZEN:
+        return f'"{sys.executable}"'
     pythonw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     if not os.path.isfile(pythonw):
         pythonw = sys.executable
@@ -1100,6 +1238,7 @@ def _ocr_lines(img):
         segments.append(current)
 
         for seg in segments:
+            seg = _strip_leading_icon(_strip_edge_junk(seg))
             joined = " ".join(w["text"] for w in seg)
             ordered = list(reversed(seg)) if _is_rtl_text(joined) else seg
             text = re.sub(r"\s+", " ", " ".join(w["text"] for w in ordered)).strip()
@@ -1179,7 +1318,61 @@ LIST_MARKER = re.compile(r"^\s*(?:\d{1,3}\s*[.)]|[•·▪◦‣*]|[-–—])(?=
 # Приводим такое начало строки к нормальному «•» — дальше его увидит LIST_MARKER.
 # Одиночную букву считаем буллитом только перед заглавной: «e Selected» — это
 # точно кружок, а «a Modern» вполне может быть началом фразы.
+# Одиночная скобка, палка или косая — это рамка кнопки или плашки, попавшая в
+# распознавание, а не знак препинания: словом такое не бывает никогда.
+EDGE_JUNK_TOKEN = re.compile(r"^[|/\\[\](){}<>«»‹›]+$")
+
+
+def _strip_edge_junk(seg):
+    """Убираем рамку кнопки или плашки, прочитанную как скобки по краям строки.
+
+    Выкидывать её из готового текста мало: рамка остаётся в габаритах блока, а
+    она вдвое выше самих букв — оценка кегля задирается, и надпись вроде «NEW»
+    рисуется втрое крупнее соседей.
+    """
+    while len(seg) > 1 and EDGE_JUNK_TOKEN.match(seg[0]["text"].strip()):
+        seg = seg[1:]
+    while len(seg) > 1 and EDGE_JUNK_TOKEN.match(seg[-1]["text"].strip()):
+        seg = seg[:-1]
+    return seg
+
+
 BULLET_JUNK = re.compile(r"^\s*(?:[•·▪◦‣*©®°¢£€§†‡»›~^]|[eoO](?=\s+[A-ZА-ЯЁ]))\s+")
+
+
+def _strip_leading_icon(seg):
+    """Убираем значок, прочитанный как одна-две буквы: «@ 1 Year Warranty».
+
+    Иконка стоит в одной строке с надписью, и Tesseract читает её как случайные
+    знаки — в переводе получается «ГБ Бесплатная доставка» и «©2 Добавить в
+    список желаний», — а сам значок ещё и закрашивается заливкой блока. От
+    настоящего короткого слова и от буллита списка значок отличают три признака,
+    все меряются по самой строке: низкая уверенность распознавания, рост выше
+    любой буквы и отрыв от текста шире, чем слова стоят друг от друга.
+    """
+    # Значок может распасться на два «слова» («С» и «О» от контурного щита),
+    # поэтому пробуем дважды. Больше двух не трогаем: дальше начинается текст.
+    for _ in range(2):
+        if len(seg) < 2:
+            break
+        head, rest = seg[0], seg[1:]
+        text = head["text"].strip()
+        if len(text) > 2 or LIST_MARKER.match(text + " "):
+            break                     # настоящее слово или маркер пункта списка
+        tall = max(w["y1"] - w["y0"] for w in rest)
+        gaps = sorted(b["x0"] - a["x1"] for a, b in zip(rest, rest[1:]))
+        typical = gaps[len(gaps) // 2] if gaps else 0.25 * tall
+        gap = rest[0]["x0"] - head["x1"]
+        # Уверенность — самый надёжный признак: настоящее короткое слово («In»,
+        # «A») Tesseract читает уверенно, а значок он не читает вовсе и выдаёт
+        # первое похожее — «©2», «19», «м’», «\\'» — с низкой оценкой.
+        unsure = head["conf"] < 65
+        taller = head["y1"] - head["y0"] > 1.3 * tall
+        far = gap > max(2.0 * max(1.0, typical), 0.4 * tall)
+        if not (unsure or taller or far):
+            break
+        seg = rest
+    return seg
 
 
 # Конец предложения. Если строка на них не заканчивается, а следующая начинается
@@ -1904,6 +2097,65 @@ def _wrap(draw, text, font, max_width):
     return lines
 
 
+def _size_bands(plans, spread=1.12):
+    """Блоки, разбитые по кеглю оригинала: подписи, тело, подзаголовки, заголовки.
+
+    Равнять кегль имеет смысл только внутри такой группы. Пока равняли всё
+    подряд, мелкая подпись под значком тянула вниз и основной текст, и
+    заголовки: каждый блок помещался в свой родной размер, но всем всё равно
+    назначался кегль нижней шестой части — перевод выходил заметно мельче
+    оригинала на ровном месте.
+    """
+    bands, current = [], []
+    for plan in sorted(plans, key=lambda p: p["start"]):
+        if current and plan["start"] > current[0]["start"] * spread:
+            bands.append(current)
+            current = []
+        current.append(plan)
+    if current:
+        bands.append(current)
+    return bands
+
+
+def _background_of(region, tol=60):
+    """Цвет фона под надписью и ровный ли он. Возвращает (цвет, ровный).
+
+    Считаем по рамке области, а не по всей: буквы стоят внутри, а по краю почти
+    всегда фон. Так решаются сразу две задачи.
+
+    Цвет: у плотно обведённой белой надписи на синей кнопке самым частым цветом
+    внутри рамки оказывались сами буквы, и плашка закрашивалась белым.
+
+    Ровность: у надписи на ровном фоне рамка одноцветная (сто из ста), у надписи
+    на градиенте — нет (около семидесяти). Долю фона по всей области считать
+    нельзя, её у плотной надписи мало; число цветов — тоже: текст на белом давал
+    74–85%, впритык к любому порогу, и часть надписей уходила под размытие,
+    оставляя на странице серую плашку ростом с оригинал.
+    """
+    width, height = region.size
+    if width < 3 or height < 3:
+        return dominant_color(region), True
+    px = region.convert("RGB").load()
+    edge = []
+    for x in range(0, width, max(1, width // 64)):
+        edge.append(px[x, 0])
+        edge.append(px[x, height - 1])
+    for y in range(0, height, max(1, height // 32)):
+        edge.append(px[0, y])
+        edge.append(px[width - 1, y])
+    # Голосуем огрублёнными цветами: сглаживание букв иначе дробит голоса.
+    votes = {}
+    for c in edge:
+        key = (c[0] // 16, c[1] // 16, c[2] // 16)
+        votes[key] = votes.get(key, 0) + 1
+    winner = max(votes.items(), key=lambda kv: kv[1])[0]
+    same = [c for c in edge if (c[0] // 16, c[1] // 16, c[2] // 16) == winner]
+    bg = tuple(sum(c[i] for c in same) // len(same) for i in range(3))
+    near = sum(1 for c in edge
+               if abs(c[0] - bg[0]) + abs(c[1] - bg[1]) + abs(c[2] - bg[2]) <= tol)
+    return bg, near >= 0.85 * len(edge)
+
+
 def _fit_text(draw, text, box_w, box_h, start_size, min_size=8, spacing=1.25):
     """Максимальный кегль, при котором перевод влезает в блок → (size, lines, line_h).
 
@@ -1913,9 +2165,15 @@ def _fit_text(draw, text, box_w, box_h, start_size, min_size=8, spacing=1.25):
     """
     size = max(min_size, min(int(start_size), 200))
     while True:
-        lines = _wrap(draw, text, _font(size, text), box_w)
+        font = _font(size, text)
+        lines = _wrap(draw, text, font, box_w)
         line_h = max(1, int(size * spacing))
-        if len(lines) * line_h <= box_h or size <= min_size:
+        # Ширину проверяем отдельно от высоты: перенос спасает не всегда.
+        # «Водонепроницаемость» — одно слово, разорвать его негде, и по числу
+        # строк оно всегда «влезало», а на картинке уезжало в соседнюю колонку
+        # поверх чужого текста. Единственный способ вместить такое — уменьшить.
+        widest = max((draw.textlength(ln, font=font) for ln in lines), default=0)
+        if (len(lines) * line_h <= box_h and widest <= box_w) or size <= min_size:
             return size, lines, line_h
         size -= 1
 
@@ -1980,6 +2238,16 @@ def render_overlay(img, blocks, translations, zoom=None):
     for idx, block in enumerate(blocks):
         x0, y0, x1, y1 = block["bbox"]
         right, bottom = block.get("col_right", src.width), src.height
+        # Блок, уже перенесённый на несколько строк, занял всю ширину своего
+        # места — колонки, карточки, ячейки: перенос и случился потому, что
+        # правее текста нет. Расти вправо ему нельзя, иначе перевод вылезает за
+        # край карточки на пустое поле — сосед справа его не удержит, соседа там
+        # нет. Однострочному расти можно: его ширина — это ширина надписи, а не
+        # ширина места под неё.
+        if block.get("lines", 1) > 1:
+            right = min(right, x1)
+        column_right = x1
+        near = 8 * (block.get("line_h") or 12)
         for other_idx, other in enumerate(blocks):
             if other_idx == idx:
                 continue
@@ -1988,6 +2256,17 @@ def render_overlay(img, blocks, translations, zoom=None):
                 right = min(right, ox0 - 4)
             if oy0 >= y1 and min(x1, ox1) > max(x0, ox0):        # сосед снизу
                 bottom = min(bottom, oy0 - 1)
+            # Сосед сверху или снизу в той же колонке. У крайней карточки соседа
+            # справа нет вовсе, и без этого признака перевод вылезал за её край
+            # на пустое поле. Где кончается колонка, показывает самая длинная
+            # строка в ней — своя же или соседняя.
+            if (min(x1, ox1) - max(x0, ox0) > 0.5 * min(x1 - x0, ox1 - ox0)
+                    and abs(oy0 - y0) < near):
+                column_right = max(column_right, ox1)
+        # Короткой подписи («Вес», «Цвет») колонка соседей всё равно мала —
+        # разрешаем ей четверть своей ширины сверх, иначе перевод такой ячейки
+        # обрезался бы многоточием на ровном месте.
+        right = min(right, max(column_right, x1 + (x1 - x0) // 4))
         limits[idx] = (max(x1, right), max(y1, bottom))
 
     # настройки шрифта перевода — см. config.json
@@ -2012,47 +2291,45 @@ def render_overlay(img, blocks, translations, zoom=None):
         # набрана строка, и перевод почти всегда получался мельче исходного.
         own_h = block.get("font_h") or block.get("line_h",
                                                  h / max(1, block.get("lines", 1)))
-        start_size = max(min_font, int(own_h * 0.95 * scale))
+        # Без запаса вниз: оценка кегля и так выходит на пару пунктов меньше
+        # исходной (Tesseract обводит буквы, а не кегельную площадку), и лишний
+        # коэффициент делал перевод мельче оригинала уже на этом шаге. Если
+        # перевод не влезет — его ужмёт _fit_text, для того он и есть.
+        start_size = max(min_font, int(round(own_h * scale)))
         avail_w = max(40, max_right - x0 - 2)
         avail_h = max(h, max_bottom - y0)
-        size, _, _ = _fit_text(draw, translated, avail_w, avail_h, start_size, min_font, spacing)
         plans.append({"box": (x0, y0, x1, y1), "text": translated, "start": start_size,
                       "avail": (avail_w, avail_h), "limit": (max_right, max_bottom),
-                      "size": size})
+                      "size": start_size})
     if not plans:
         return out.crop((0, 0, out.width, base_h))
 
-    # --- проход 2: общий кегль для «тела» текста.
-    # Каждый блок ужимается под свою рамку независимо, поэтому короткая строка
-    # оставалась в исходном размере, а длинная падала до минимума — рядом стоящие
-    # строки различались вдвое. Берём самый мелкий кегль по телу и равняем на него.
-    # Заголовки (исходный шрифт заметно крупнее медианы) считаем отдельно, иначе
-    # они схлопнутся до размера основного текста.
-    starts = sorted(p["start"] for p in plans)
-    median_start = starts[len(starts) // 2]
-    body = [p for p in plans if p["start"] <= 1.35 * median_start]
-    if uniform and body:
-        # Пол, чтобы один переполненный блок не утащил за собой всю картинку.
-        # Раньше он был вдвое ниже исходного шрифта, и хватало одной тесной
-        # карточки, чтобы весь перевод стал нечитаемо мелким: лучше обрезать
-        # такой блок многоточием, чем мельчить всю картинку.
-        floor = max(min_font, int(median_start * 0.75))
-        # Равняемся не на самый тесный блок, а на нижнюю шестую часть: одна
-        # тесная карточка не должна мельчить весь снимок. Тем немногим, кому
-        # этого кегля мало, текст обрежется многоточием — так честнее, и
-        # полный текст всё равно есть в текстовом режиме.
-        sizes = sorted(p["size"] for p in body)
-        common = max(floor, sizes[len(sizes) // 6])
-        for p in body:
-            p["size"] = min(p["size"], common)
-        # Заголовки на общий кегль не равняем — они схлопнутся, — но ужимаем в
-        # той же доле. Иначе на снимке, где тело пришлось заметно ужать, рядом
-        # с мелким текстом остаётся надпись вдвое крупнее соседей.
-        shrink = common / max(1.0, float(median_start))
-        if shrink < 0.99:
-            for p in plans:
-                if p["start"] > 1.35 * median_start:
-                    p["size"] = max(min_font, min(p["size"], int(p["start"] * shrink)))
+    # --- проход 2: кегль по классам текста.
+    # Блоки разбиты по кеглю оригинала: подписи, тело, заголовки. Общий кегль на
+    # всех означал, что самый тесный блок мельчит весь снимок, — поэтому классы
+    # считаются порознь.
+    for band in _size_bands(plans):
+        # Внутри класса равняемся на его медиану, а не на собственную оценку
+        # блока. Кегль оригинала берётся из рамки строки, и на коротких словах
+        # без выносных букв («Вес», «Модель») оценка пляшет на пару пунктов —
+        # соседние строки таблицы от этого прыгали.
+        target = band[len(band) // 2]["start"]             # band отсортирован
+        for p in band:
+            avail_w, avail_h = p["avail"]
+            p["size"] = _fit_text(draw, p["text"], avail_w, avail_h,
+                                  target if uniform else p["start"],
+                                  min_font, spacing)[0]
+        if uniform:
+            # Равняемся не на самый тесный блок, а на нижнюю шестую часть: одна
+            # тесная карточка не должна мельчить остальные, ей текст обрежется
+            # многоточием. Ниже пола не опускаемся в любом случае: лучше обрезать
+            # хвост одному блоку, чем сделать нечитаемым весь класс.
+            floor = max(min_font, int(target * 0.85))
+            sizes = sorted(p["size"] for p in band)
+            common = max(floor, sizes[len(sizes) // 6])
+            for p in band:
+                p["size"] = min(p["size"], common)
+            log(f"кегль класса ~{target}: общий {common}, блоков {len(band)}")
 
     # --- проход 3: раскладка строк окончательным кеглем
     for p in plans:
@@ -2080,9 +2357,19 @@ def render_overlay(img, blocks, translations, zoom=None):
 
         # фон берём из ИСХОДНОЙ картинки: на out уже могли лечь чужие заливки
         region = src.crop((x0, y0, px1, py1))
-        bg = dominant_color(region)                   # цвет фона под текстом
-        base = region.filter(ImageFilter.GaussianBlur(max(2, h // 6)))
-        out.paste(Image.blend(base, Image.new("RGB", base.size, bg), 0.93), (x0, y0))
+        bg, even = _background_of(region)             # цвет фона и ровный ли он
+        flat = Image.new("RGB", region.size, bg)
+        if even:
+            # Ровный фон — страница, карточка, ячейка таблицы — закрашиваем
+            # начисто. Смесь с размытым оригиналом оставляла на белом поле
+            # серую тень ростом с исходную надпись: перевод короче и мельче, и
+            # «стёртое» место торчало прямоугольником рядом с каждой строкой.
+            out.paste(flat, (x0, y0))
+        else:
+            # Под текстом картинка или градиент: там ровная плашка выглядит
+            # заплаткой, и размытие честнее.
+            base = region.filter(ImageFilter.GaussianBlur(max(2, h // 6)))
+            out.paste(Image.blend(base, flat, 0.93), (x0, y0))
 
         light = (0.299 * bg[0] + 0.587 * bg[1] + 0.114 * bg[2]) > 140
         p["color"] = (20, 20, 20) if light else (243, 243, 243)
@@ -3169,7 +3456,7 @@ class App:
         заранее, честнее назвать его прямо — распознавание выходит вдвое
         быстрее и точнее.
         """
-        have = available_ocr_langs() - {"osd"}
+        have = available_ocr_langs() - {"osd"} - HIDDEN_OCR_LANGS
         codes = ["auto"]
         for code in ("eng", "rus"):
             if code in have:
@@ -3417,7 +3704,102 @@ def already_running():
     return kernel32.GetLastError() == ERROR_ALREADY_EXISTS
 
 
+# --------------------------------------------------------------------------------------
+#  Самопроверка
+# --------------------------------------------------------------------------------------
+def selftest():
+    """Проходим всю цепочку и печатаем отчёт: пути, Tesseract, OCR, перевод.
+
+    Нужна на чужом компьютере, куда не заглянешь: человек запускает
+    «Проверка.bat» и присылает снимок консоли — по нему сразу видно, какой
+    именно кусок не поднялся.
+    """
+    failed = []
+
+    def step(name, check):
+        try:
+            print(f"[ok] {name}: {check()}")
+        except Exception as e:
+            print(f"[!!] {name}: {e}")
+            failed.append(name)
+
+    def check_langs():
+        langs = available_ocr_langs()
+        if not langs:
+            raise RuntimeError("Tesseract не видит ни одного языка")
+        missing = {"eng", "osd"} - langs
+        if missing:
+            raise RuntimeError(f"нет обязательных: {', '.join(sorted(missing))}")
+        return f"{len(langs)} шт. — {', '.join(sorted(langs))}"
+
+    def check_ocr():
+        img = Image.new("RGB", (460, 96), "white")
+        draw = ImageDraw.Draw(img)
+        try:
+            font = ImageFont.truetype(FONT_CANDIDATES[0], 46)
+        except OSError:
+            font = ImageFont.load_default()
+        draw.text((20, 22), "Hello world", font=font, fill="black")
+        got = pytesseract.image_to_string(img, lang="eng").strip()
+        if "hello" not in got.lower():
+            raise RuntimeError(f"вместо «Hello world» прочиталось «{got}»")
+        return f"«{got}»"
+
+    def check_translate():
+        result, _ = translate("Hello world", target="ru")
+        if not result:
+            raise RuntimeError("сервис вернул пустой ответ")
+        return f"«Hello world» → «{result}»"
+
+    def check_gui():
+        """Окно, картинка в нём и иконка в трее.
+
+        Эти три модуля программа подгружает уже на ходу, поэтому при сборке .exe
+        они теряются легче всего — а заметно это становится только в тот момент,
+        когда человек нажал горячую клавишу и ничего не произошло.
+        """
+        import pystray  # noqa: F401
+        from PIL import ImageTk
+        root = tk.Tk()
+        try:
+            root.withdraw()
+            ImageTk.PhotoImage(Image.new("RGB", (8, 8), "white"))
+        finally:
+            root.destroy()
+        try:
+            from pynput import keyboard  # noqa: F401
+            spare = "pynput на месте"
+        except Exception:
+            # запасной способ ловить горячие клавиши; основной — WinAPI
+            spare = "без pynput (не страшно)"
+        return f"окно рисуется, трей и {spare}"
+
+    print("Экранный переводчик — самопроверка")
+    print(f"папка программы : {APP_DIR}")
+    print(f"файлы настроек  : {DATA_DIR}")
+    print(f"tesseract.exe   : {TESSERACT_CMD}")
+    print(f"языки OCR       : {LOCAL_TESSDATA or 'системные'}")
+    print(f"временная папка : {TEMP_DIR}")
+    print()
+
+    step("Tesseract запускается", lambda: f"версия {pytesseract.get_tesseract_version()}")
+    step("Языки распознавания", check_langs)
+    step("Распознавание текста", check_ocr)
+    step("Перевод через интернет", check_translate)
+    step("Окно и иконка в трее", check_gui)
+
+    print()
+    if failed:
+        print("НЕ РАБОТАЕТ: " + ", ".join(failed))
+        print("Пришлите этот текст автору программы.")
+        return 1
+    print("ВСЁ РАБОТАЕТ. Закрывайте окно и пользуйтесь Ctrl+Alt+Z.")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--selftest" in sys.argv:
+        sys.exit(selftest())
     if already_running():
         print("Экранный переводчик уже запущен — ищите синюю иконку в трее.")
         sys.exit(0)
