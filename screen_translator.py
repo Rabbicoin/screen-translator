@@ -652,6 +652,8 @@ UI_STRINGS = {
     "font_smaller":  ("Шрифт перевода мельче", "Smaller translation font"),
     "autostart":     ("Запускать при включении компьютера", "Run at startup"),
     "settings":      ("Открыть настройки", "Open settings"),
+    "copy_sel":      ("Копировать выделенное", "Copy selection"),
+    "select_all":    ("Выделить всё", "Select all"),
     "quit":          ("Выход", "Exit the program"),
     "ocr_auto":      ("Определять автоматически", "Detect automatically"),
     "svc_free":      ("Бесплатный (Google, с лимитами)", "Free (Google, rate-limited)"),
@@ -2593,6 +2595,17 @@ class Tooltip:
             self.tip = None
 
 
+# Клавиши, которые текст не меняют: по ним в поле «только для чтения» ходить
+# можно. Всё остальное там перехватывается.
+NAV_KEYS = {"Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+            "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R"}
+
+# Коды клавиш Windows: в отличие от названий, они одинаковы при любой раскладке.
+# При русской раскладке Ctrl+C приходит как «Cyrillic_es», штатная привязка Tk
+# <Control-c> не срабатывает, и выделенное не копировалось вовсе.
+KEY_A, KEY_C, KEY_INSERT = 65, 67, 45
+
+
 class ResultWindow:
     """Окно поверх всех: либо картинка с наложенным переводом, либо текстовая панель."""
 
@@ -2737,7 +2750,7 @@ class ResultWindow:
 
             body = self.original if self.text_kind == "orig" else self.translated
             text.insert("end", body or tr("no_text"))
-            text.configure(state="disabled")
+            self._make_readonly(text)
             self.text_widget = text
             # колесо здесь листает текст, поэтому кегль — на Ctrl+колесо
             text.bind("<Control-MouseWheel>", self._wheel)
@@ -3134,6 +3147,64 @@ class ResultWindow:
             return
         self._resize_from = None
         self._build(focus=False)       # полосы прокрутки могли появиться или пропасть
+
+    def _make_readonly(self, text):
+        """Поле только для чтения, но с живым выделением и копированием.
+
+        Через state="disabled" этого не добиться: такое поле в Tk не берёт
+        фокус, нажатый Ctrl+C уходить некуда, и кусок текста нельзя было
+        скопировать — только целиком, кнопкой. Поэтому поле остаётся обычным, а
+        от правки его бережёт разбор клавиш.
+        """
+        def copy_selection(_=None):
+            try:
+                chunk = text.get("sel.first", "sel.last")
+            except tk.TclError:
+                return "break"                 # ничего не выделено
+            if chunk:
+                try:
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(chunk)
+                    self.root.update()
+                except Exception:
+                    pass
+            return "break"
+
+        def select_all(_=None):
+            text.tag_add("sel", "1.0", "end-1c")
+            text.focus_set()
+            return "break"
+
+        def on_key(event):
+            if event.state & 0x4:                       # Ctrl
+                if event.keycode in (KEY_C, KEY_INSERT):
+                    return copy_selection()
+                if event.keycode == KEY_A:
+                    return select_all()
+                if event.keysym in NAV_KEYS:
+                    return None                # Ctrl+стрелка — по словам
+                return "break"                 # вставку и вырезание не пускаем
+            if event.keysym in NAV_KEYS:
+                return None
+            return "break"
+
+        text.bind("<Key>", on_key)
+
+        # Меню по правой кнопке: про Ctrl+C догадается не каждый, а кнопка ⧉
+        # рядом копирует весь текст целиком, не выделенный кусок.
+        menu = tk.Menu(text, tearoff=0)
+        menu.add_command(label=tr("copy_sel"), command=copy_selection)
+        menu.add_command(label=tr("select_all"), command=select_all)
+
+        def popup(event):
+            text.focus_set()
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+            return "break"
+
+        text.bind("<Button-3>", popup)
 
     def copy(self):
         # копируем то, что сейчас на экране: в режиме оригинала — оригинал
