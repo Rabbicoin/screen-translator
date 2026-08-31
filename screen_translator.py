@@ -886,6 +886,8 @@ def ocr_lang_candidates(img):
     wide = "+".join(sorted(have))
     if wide and wide not in order:
         order.append(wide)
+    global LAST_SCRIPT
+    LAST_SCRIPT = script
     log(f"письменность {script or 'не определена'} (уверенность {conf:.1f}), "
         f"порядок попыток: {order}")
     return order or ["eng"]
@@ -1136,6 +1138,95 @@ def _column_gaps(words, width, min_gap):
     return gaps
 
 
+# Письменность, определённая для последнего снимка. Нужна второму проходу
+# распознавания, чтобы не спрашивать её повторно (это лишние 0,3 секунды).
+LAST_SCRIPT = None
+
+
+def narrow_langs(langs, script):
+    """Узкий набор для второго прохода: языки выбранного набора, родные для
+    письменности на картинке. Для «eng+rus» на кириллице это «rus».
+
+    Пустая строка означает «второй проход не нужен»: набор и так из одного
+    языка либо целиком чужой определённой письменности.
+    """
+    parts = [p for p in langs.split("+") if p]
+    if len(parts) < 2:
+        return ""
+    native = CJK_LANGS if script in CJK_SCRIPTS else SCRIPT_LANGS.get(script or "", [])
+    inner = [p for p in parts if p in native]
+    return "+".join(inner) if inner and len(inner) < len(parts) else ""
+
+
+def mixed_scripts(words, least=3):
+    """На картинке есть слова и латиницей, и кириллицей — не меньше «least» тех
+    и других. Только в этом случае второй проход имеет смысл: на одноязычном
+    снимке путать нечего, а лишние две секунды никому не нужны.
+    """
+    latin = cyrillic = 0
+    for word in words:
+        letters = [c for c in word["text"] if c.isalpha()]
+        if not letters:
+            continue
+        if sum(1 for c in letters if "\u0400" <= c <= "\u04FF") > len(letters) / 2:
+            cyrillic += 1
+        else:
+            latin += 1
+        if latin >= least and cyrillic >= least:
+            return True
+    return False
+
+
+def _digit_soup(text):
+    """Цифры вперемешку с буквами внутри слова: «6e3», «1PX7»."""
+    return any(c.isalpha() for c in text) and any(c.isdigit() for c in text)
+
+
+def merge_readings(primary, other):
+    """Берём из второго прохода те слова, что прочитаны увереннее.
+
+    Смешанный набор («eng+rus») читает латиницу правильно, но кириллицу
+    подменяет похожими латинскими буквами: «без НДС» превращается в «6e3 HOC»,
+    «АКПП» в «AKNN». Узкий набор («rus») читает кириллицу верно, но латинские
+    названия теряет целиком — по отдельности не годится ни тот, ни другой.
+
+    Слова сопоставляются по месту на картинке, а выбор решает уверенность
+    Tesseract. Там, где узкий набор увереннее, он и прав («НДС» 89 против «HOC»
+    67); там, где увереннее смешанный, это как раз латинское название («NISSAN»
+    92 против «№ЗЗАМ» 53), и его мы не трогаем.
+    """
+    pool = [w for words in other.values() for w in words]
+    if not pool:
+        return 0
+    fixed = 0
+    for words in primary.values():
+        for word in words:
+            area = max(1, (word["x1"] - word["x0"]) * (word["y1"] - word["y0"]))
+            best, cover = None, 0.0
+            for cand in pool:
+                dx = min(word["x1"], cand["x1"]) - max(word["x0"], cand["x0"])
+                dy = min(word["y1"], cand["y1"]) - max(word["y0"], cand["y0"])
+                if dx <= 0 or dy <= 0:
+                    continue
+                share = dx * dy / area
+                if share > cover:
+                    best, cover = cand, share
+            if not best or cover < 0.6 or best["text"] == word["text"]:
+                continue
+            take = best["conf"] > word["conf"]
+            if not take and best["conf"] >= word["conf"] - 3:
+                # Ничья по уверенности. Смешанный набор любит подменять буквы
+                # похожими цифрами: «без» -> «6e3», «шт.» -> «wT.». Если у него
+                # в слове цифры вперемешку с буквами, а у узкого — чистые
+                # буквы, прав узкий. Латинские артикулы («VQ23DE») правило не
+                # задевает: там цифры есть у обоих прочтений.
+                take = _digit_soup(word["text"]) and not _digit_soup(best["text"])
+            if take:
+                word["text"], word["conf"] = best["text"], best["conf"]
+                fixed += 1
+    return fixed
+
+
 def _ocr_lines(img):
     """Распознанные строки: [{text, box, conf, col}], сверху вниз.
 
@@ -1192,7 +1283,15 @@ def _ocr_lines(img):
         if kept and dropped <= max(1, kept * 0.25):
             break                      # прочитали уверенно, дальше искать нечего
 
+    # Второй проход: узкий набор языков поверх выбранного. Нужен только на
+    # смешанном тексте — там смешанный набор путает кириллицу с латиницей.
     all_words = [w for words in lines.values() for w in words]
+    refine = narrow_langs(langs, LAST_SCRIPT)
+    if refine and refine != langs and mixed_scripts(all_words):
+        found, kept, _ = read(refine)
+        fixed = merge_readings(lines, found)
+        log(f"второй проход «{refine}»: прочитано {kept}, поправлено слов {fixed}")
+        all_words = [w for words in lines.values() for w in words]
     heights = sorted(w["y1"] - w["y0"] for w in all_words) or [10]
     median_h = heights[len(heights) // 2]
     # Колонки ищем только там, где строк несколько. На одной строке любой пробел
