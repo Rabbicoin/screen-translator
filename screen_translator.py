@@ -19,6 +19,7 @@ import json
 import os
 import queue
 import re
+from concurrent.futures import ThreadPoolExecutor
 import shutil
 import sys
 import tempfile
@@ -1626,8 +1627,36 @@ def ocr_blocks(img):
             "line_step": step,
             "col_right": int(col_right),
         })
+    blocks = reading_order(blocks)
     log(f"OCR: строк {len(lines)}, блоков {len(blocks)}, отброшено мусора {skipped}")
     return join_blocks(blocks), blocks, langs
+
+
+def reading_order(blocks):
+    """Блоки в порядке чтения: строками сверху вниз, внутри строки слева направо.
+
+    Сортировки по (верх, лево) на таблице не хватает: ячейки одной строки стоят
+    на пиксель-другой выше или ниже соседних, и «шт.» из одной строки
+    оказывалось между названиями из разных — текст оригинала переставал
+    совпадать с картинкой. Поэтому сначала собираем блоки в полосы по
+    вертикальному перекрытию, а уже внутри полосы сортируем слева направо.
+    """
+    rows = []
+    for block in sorted(blocks, key=lambda b: (b["bbox"][1], b["bbox"][0])):
+        y0, y1 = block["bbox"][1], block["bbox"][3]
+        for row in rows:
+            overlap = min(y1, row["bottom"]) - max(y0, row["top"])
+            if overlap > 0.5 * min(y1 - y0, row["bottom"] - row["top"]):
+                row["items"].append(block)
+                row["top"] = min(row["top"], y0)
+                row["bottom"] = max(row["bottom"], y1)
+                break
+        else:
+            rows.append({"top": y0, "bottom": y1, "items": [block]})
+    out = []
+    for row in rows:
+        out.extend(sorted(row["items"], key=lambda b: b["bbox"][0]))
+    return out
 
 
 def join_blocks(blocks, texts=None):
@@ -1928,6 +1957,11 @@ def _needs_retranslate(src, dst, target):
     """Похоже, этот кусок не перевёлся, а вернулся как был."""
     if not is_translatable(src):
         return False
+    # Исходник уже на языке перевода — вернуть его как был и есть правильный
+    # ответ, а не отказ. Без этой проверки русский счёт, переводимый на русский,
+    # выглядел как сотня неудач подряд.
+    if already_target(src, target):
+        return False
     if not dst.strip():
         return True
     if dst.strip() == src.strip():
@@ -1950,9 +1984,26 @@ def translate_many(texts, target=None, source_hint=None):
     каждого своё автоопределение языка.
     """
     target = target or CFG.get("target_lang", "ru")
-    texts = [t for t in texts]
+    texts = list(texts)
     if not texts:
         return []
+
+    # Куски, уже написанные на языке перевода, не отправляем вовсе. На русском
+    # счёте, переводимом на русский, это почти вся таблица: сервис возвращал их
+    # без изменений, программа считала это неудачей и переспрашивала каждый
+    # отдельным запросом — сотня запросов и полминуты ожидания на ровном месте.
+    todo = [i for i, t in enumerate(texts) if not already_target(t, target)]
+    if not todo:
+        log(f"переводить нечего: все {len(texts)} кусков уже на «{target}»")
+        return list(texts)
+    if len(todo) < len(texts):
+        log(f"уже на «{target}»: {len(texts) - len(todo)} из {len(texts)}, не трогаем")
+        done = list(texts)
+        for i, value in zip(todo, translate_many([texts[i] for i in todo],
+                                                 target, source_hint)):
+            done[i] = value
+        return done
+
     if len(texts) == 1:
         return [translate(texts[0], target, source_hint)[0]]
 
@@ -1972,13 +2023,22 @@ def translate_many(texts, target=None, source_hint=None):
              if _needs_retranslate(src, dst, target)]
     if retry:
         log(f"до-переводим по одному: {len(retry)} из {len(texts)}")
-    for n, i in enumerate(retry):
-        if n:
-            time.sleep(0.2)                # бесплатный endpoint не любит очередь
-        try:
-            parts[i] = translate(texts[i], target, source_hint)[0]
-        except Exception as e:
-            log(f"кусок {i} не перевёлся:", e)
+
+        def one(i):
+            try:
+                return i, translate(texts[i], target, source_hint)[0]
+            except Exception as e:
+                log(f"кусок {i} не перевёлся:", e)
+                return i, parts[i]
+
+        # Разом, а не по очереди. Каждый такой запрос идёт треть секунды, и на
+        # счёте из сотни строк набегало четырнадцать секунд ожидания — притом
+        # что почти все эти куски (имена деталей, артикулы) возвращаются как
+        # были. Больше четырёх запросов сразу бесплатной точке перевода не
+        # нравится: она отвечает «слишком часто» и уходит в отказ.
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for i, value in pool.map(one, retry):
+                parts[i] = value
     return parts
 
 
