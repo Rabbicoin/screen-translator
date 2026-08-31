@@ -106,6 +106,7 @@ def data_file(name):
 
 CONFIG_PATH = data_file("config.json")
 GLOSSARY_PATH = data_file("glossary.json")
+OCR_WORDS_PATH = data_file("ocr_words.txt")
 DEBUG = os.environ.get("ST_DEBUG") == "1"
 
 
@@ -1323,6 +1324,12 @@ def _ocr_lines(img):
                                if len(band) > 1 and other_row else [])
         return band_cache[key]
 
+    # Какой письменности на снимке больше: по ней решается, какие слова из
+    # списка вообще могут всплыть.
+    page_letters = [c for w in all_words for c in w["text"] if c.isalpha()]
+    cyrillic_page = bool(page_letters) and sum(
+        1 for c in page_letters if "\u0400" <= c <= "\u04FF") > len(page_letters) / 2
+
     out = []
     for key, words in lines.items():
         words.sort(key=lambda w: w["x0"])
@@ -1340,7 +1347,8 @@ def _ocr_lines(img):
         segments.append(current)
 
         for seg in segments:
-            seg = _strip_leading_icon(_strip_edge_junk(seg))
+            seg = fix_lookalikes(_strip_leading_icon(_strip_edge_junk(seg)),
+                                 cyrillic_page)
             joined = " ".join(w["text"] for w in seg)
             ordered = list(reversed(seg)) if _is_rtl_text(joined) else seg
             text = re.sub(r"\s+", " ", " ".join(w["text"] for w in ordered)).strip()
@@ -1440,6 +1448,87 @@ def _strip_edge_junk(seg):
 
 
 BULLET_JUNK = re.compile(r"^\s*(?:[•·▪◦‣*©®°¢£€§†‡»›~^]|[eoO](?=\s+[A-ZА-ЯЁ]))\s+")
+
+
+# Значок -> общая буква. Слева то, что выглядит одинаково: латинская «B»,
+# русская «В», русская «б» и цифра «6» — на экране это почти один рисунок, и
+# распознавание выбирает между ними наугад. Приводя слово к этим общим буквам,
+# получаем его «форму»: у «Всего» и «Bcero» она одна и та же.
+LOOKALIKE = {"а": "a", "е": "e", "ё": "e", "о": "o", "р": "p", "с": "c", "у": "y",
+             "х": "x", "к": "k", "м": "m", "н": "h", "т": "t", "в": "b", "б": "b",
+             "г": "r", "п": "n", "и": "u", "ш": "w", "з": "3", "ч": "4", "д": "d",
+             "л": "l", "ф": "f", "э": "e", "6": "b", "0": "o", "1": "l", "5": "s"}
+
+_ocr_words = {"mtime": None, "index": {}}
+
+
+def word_shape(word):
+    """«Форма» слова: одинаковые с виду знаки сведены к одной букве."""
+    return "".join(LOOKALIKE.get(ch, ch) for ch in word.lower())
+
+
+def ocr_words():
+    """Список знакомых слов: {форма: слово}. Перечитывается по времени файла."""
+    try:
+        mtime = os.path.getmtime(OCR_WORDS_PATH)
+    except OSError:
+        _ocr_words["mtime"], _ocr_words["index"] = None, {}
+        return {}
+    if mtime == _ocr_words["mtime"]:
+        return _ocr_words["index"]
+    index = {}
+    try:
+        with open(OCR_WORDS_PATH, encoding="utf-8") as f:
+            for line in f:
+                word = line.strip()
+                if not word or word.startswith("#") or len(word) < 2:
+                    continue          # слишком короткое слово подошло бы ко всему
+                index.setdefault(word_shape(word), word)
+    except Exception as e:
+        print("ocr_words.txt не прочитался:", e)
+        index = {}
+    _ocr_words["mtime"], _ocr_words["index"] = mtime, index
+    log(f"слов в списке распознавания: {len(index)}")
+    return index
+
+
+def _is_cyrillic_word(text):
+    letters = [c for c in text if c.isalpha()]
+    return bool(letters) and sum(1 for c in letters
+                                 if "\u0400" <= c <= "\u04FF") > len(letters) / 2
+
+
+def fix_lookalikes(seg, cyrillic_page):
+    """Возвращаем на место слова, спутанные из-за букв-двойников.
+
+    Заменяем, только если прочитанное слово написано не той письменностью, что
+    преобладает НА СНИМКЕ. Иначе английское «bud» на английской же странице
+    превратилось бы в русское «Вид»: по форме значков они неразличимы, и
+    единственное, что их разводит, — язык остального текста. Считать по одной
+    строке нельзя: в таблице ячейка «Bcero» целиком латинская, и языка в ней
+    не видно вовсе.
+    """
+    index = ocr_words()
+    if not index:
+        return seg
+    for word in seg:
+        text = word["text"]
+        head = text[:len(text) - len(text.lstrip("([{|«\"\'"))]
+        core = text[len(head):]
+        tail = ""
+        while core and not core[-1].isalnum():
+            core, tail = core[:-1], core[-1] + tail
+        if len(core) < 2:
+            continue
+        known = index.get(word_shape(core))
+        if not known or known.lower() == core.lower():
+            continue
+        if _is_cyrillic_word(known) != cyrillic_page:
+            continue                       # подсказка не на языке снимка
+        if _is_cyrillic_word(core) == cyrillic_page:
+            continue                       # прочитано и так на нужной письменности
+        word["text"] = head + known + tail
+    return seg
 
 
 def _strip_leading_icon(seg):

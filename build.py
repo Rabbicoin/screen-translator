@@ -46,7 +46,7 @@ EXE_DEBUG = "Переводчик (отладка).exe"
 
 # Файлы, которые человек может открыть и поправить: лежат рядом с .exe.
 # README едет отдельно и урезанным — см. public_readme.
-SHIPPED_FILES = ["glossary.json"]
+SHIPPED_FILES = ["glossary.json", "ocr_words.txt"]
 SHIPPED_GLOBS = ["ui_*.json"]
 
 # Разделы README, которые к человеку не едут. «Как устроено» — разбор того, как
