@@ -2101,7 +2101,10 @@ def glossary_rules():
             data = json.load(f)
         for src, dst in data.items():
             src = str(src).strip()
-            if src:
+            # JSON не умеет комментариев, а пояснение в файле нужно — и автору
+            # словаря, и в образце из сборки. Ключи с подчёркивания — заметки,
+            # правилами не становятся.
+            if src and not src.startswith("_"):
                 rules.append((re.compile(re.escape(src), re.IGNORECASE), str(dst)))
         # длинные фразы применяем первыми, иначе их съедят замены покороче
         rules.sort(key=lambda r: -len(r[0].pattern))

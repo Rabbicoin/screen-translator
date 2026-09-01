@@ -46,7 +46,10 @@ EXE_DEBUG = "Переводчик (отладка).exe"
 
 # Файлы, которые человек может открыть и поправить: лежат рядом с .exe.
 # README едет отдельно и урезанным — см. public_readme.
-SHIPPED_FILES = ["glossary.json", "ocr_words.txt"]
+SHIPPED_FILES = ["ocr_words.txt"]
+# Словарь замен у каждого свой, и в нём легко оказываются рабочие термины автора.
+# В сборку едет образец, а не рабочий файл: имя слева — что берём, справа — как ляжет.
+SHIPPED_AS = {"glossary.example.json": "glossary.json"}
 SHIPPED_GLOBS = ["ui_*.json"]
 
 # Разделы README, которые к человеку не едут. «Как устроено» — разбор того, как
@@ -381,6 +384,10 @@ def copy_extras():
     for pattern in SHIPPED_GLOBS:
         for path in glob.glob(os.path.join(HERE, pattern)):
             shutil.copy2(path, os.path.join(BUNDLE, os.path.basename(path)))
+    for src, dst in SHIPPED_AS.items():
+        path = os.path.join(HERE, src)
+        if os.path.isfile(path):
+            shutil.copy2(path, os.path.join(BUNDLE, dst))
 
     with open(os.path.join(BUNDLE, "Как пользоваться.txt"), "w",
               encoding="utf-8-sig", newline="\r\n") as f:
