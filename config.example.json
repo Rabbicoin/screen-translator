@@ -1,0 +1,23 @@
+{
+  "hotkey_capture": "<ctrl>+<alt>+z",
+  "hotkey_clipboard": "<ctrl>+<alt>+x",
+  "target_lang": "ru",
+  "translator": "free",
+  "api_key": "",
+  "ocr_langs": "auto",
+  "ocr_langs_fallback": "eng+rus",
+  "tesseract_path": "",
+  "ocr_scale": 2.0,
+  "tesseract_psm": 3,
+  "theme": "light",
+  "promo_url": "https://sevdev.ru/screen-translator/promo.json",
+  "promo_hours": 24,
+  "display_mode": "overlay",
+  "auto_copy": true,
+  "font_size": 12,
+  "overlay_font_scale": 1.0,
+  "overlay_zoom": 1.0,
+  "overlay_min_font": 8,
+  "overlay_line_spacing": 1.25,
+  "overlay_uniform_font": true
+}
