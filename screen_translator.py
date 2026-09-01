@@ -134,7 +134,10 @@ DEFAULT_CONFIG = {
     # Подпись внизу окна перевода: видна сразу и не зависит от сайта. Объявление
     # с сайта, пока оно есть, показывается вместо неё — у новости срок годности,
     # у контактов его нет. Пусто — строки не будет вовсе.
-    "footer_text": "Вопросы и пожелания: Telegram @rabbiecho · sevdev.ru",
+    "footer_text": "Вопросы и пожелания: "
+                    "[Telegram @rabbiecho](https://t.me/rabbiecho) · "
+                    "[sevdev.ru](https://sevdev.ru)",
+    # Запасная ссылка на всю строку — работает, если в тексте нет ссылок в скобках.
     "footer_url": "https://sevdev.ru",
     "display_mode": "overlay",   # "overlay" — поверх области, "panel" — окном с текстом
     "auto_copy": True,
@@ -501,6 +504,37 @@ def _promo_path():
     return data_file("promo_cache.json")
 
 
+LINK_RE = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+
+
+def promo_parts(text, fallback_url=""):
+    """Строка подписи → куски [(текст, ссылка или "")].
+
+    Ссылки пишутся прямо в тексте: "пишите в [Telegram](https://t.me/имя)".
+    Так в одной строке живут два разных адреса — раньше вся строка вела на один,
+    и щелчок по слову «Telegram» открывал сайт.
+
+    Разметки нет — строка остаётся одним куском с запасной ссылкой, как раньше.
+    Длину считаем по видимому тексту, иначе обрезка рубит середину адреса.
+    """
+    parts, pos, shown = [], 0, 0
+    for m in LINK_RE.finditer(text):
+        for chunk, url in ((text[pos:m.start()], ""), (m.group(1), m.group(2))):
+            if chunk and shown < PROMO_LIMIT:
+                chunk = chunk[:PROMO_LIMIT - shown]
+                shown += len(chunk)
+                parts.append((chunk, url))
+        pos = m.end()
+    tail = text[pos:]
+    if tail and shown < PROMO_LIMIT:
+        parts.append((tail[:PROMO_LIMIT - shown], "" if parts else fallback_url))
+    if not parts:
+        return []
+    if len(parts) == 1 and not parts[0][1]:
+        return [(parts[0][0], fallback_url)]
+    return parts
+
+
 def _footer_line():
     """Постоянная подпись из настроек: контакты автора. Или None."""
     text = " ".join(str(CFG.get("footer_text", "") or "").split())
@@ -509,7 +543,7 @@ def _footer_line():
     url = str(CFG.get("footer_url", "") or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         url = ""
-    return text[:PROMO_LIMIT], url
+    return text, url
 
 
 def promo_line():
@@ -535,7 +569,7 @@ def promo_line():
     url = str(data.get("url") or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         url = ""
-    return text[:PROMO_LIMIT], url
+    return text, url
 
 
 def load_promo():
@@ -3134,15 +3168,23 @@ class ResultWindow:
 
         promo = promo_line()
         if promo:
-            text, url = promo
-            strip = tk.Label(self.body, text=text, bg=c["bar"], fg=c["dim"], anchor="w",
-                             font=("Segoe UI", 9), padx=12, pady=4,
-                             cursor="hand2" if url else "arrow")
+            # Ð¡ÑÑÐ¾ÐºÐ° ÑÐ¾Ð±Ð¸ÑÐ°ÐµÑÑÑ Ð¸Ð· ÐºÑÑÐºÐ¾Ð²: Ñ ÐºÐ°Ð¶Ð´Ð¾Ð¹ ÑÑÑÐ»ÐºÐ¸ ÑÐ²Ð¾Ð¹ Ð°Ð´ÑÐµÑ. ÐÐ´Ð½Ð¾Ð¹
+            # Ð½Ð°Ð´Ð¿Ð¸ÑÑÑ ÑÑÑ Ð½Ðµ Ð¾Ð±Ð¾Ð¹ÑÐ¸ÑÑ: Tkinter Ð½Ðµ ÑÐ¼ÐµÐµÑ Ð²ÐµÑÐ°ÑÑ ÑÐ°Ð·Ð½ÑÐµ Ð´ÐµÐ¹ÑÑÐ²Ð¸Ñ
+            # Ð½Ð° ÑÐ°ÑÑÐ¸ Ð¾Ð´Ð½Ð¾Ð³Ð¾ Label.
+            parts = promo_parts(promo[0], promo[1])
+            strip = tk.Frame(self.body, bg=c["bar"])
             strip.pack(fill="x")
-            if url:
-                strip.bind("<Button-1>", lambda e, u=url: webbrowser.open(u))
-                strip.bind("<Enter>", lambda e: strip.configure(fg=c["btn"]))
-                strip.bind("<Leave>", lambda e: strip.configure(fg=c["dim"]))
+            for i, (chunk, link) in enumerate(parts):
+                lbl = tk.Label(strip, text=chunk, bg=c["bar"],
+                               fg=c["btn"] if link else c["dim"],
+                               font=("Segoe UI", 9), pady=4,
+                               cursor="hand2" if link else "arrow")
+                lbl.pack(side="left", padx=(12, 0) if i == 0 else 0)
+                if link:
+                    lbl.bind("<Button-1>", lambda e, u=link: webbrowser.open(u))
+                    lbl.bind("<Enter>",
+                             lambda e, w=lbl: w.configure(font=("Segoe UI", 9, "underline")))
+                    lbl.bind("<Leave>", lambda e, w=lbl: w.configure(font=("Segoe UI", 9)))
 
         self.win.update_idletasks()
         self._place(width)
