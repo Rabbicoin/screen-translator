@@ -131,6 +131,11 @@ DEFAULT_CONFIG = {
     # никуда, кроме сервиса перевода.
     "promo_url": "https://sevdev.ru/screen-translator/promo.json",
     "promo_hours": 24,          # как часто его перечитывать
+    # Подпись внизу окна перевода: видна сразу и не зависит от сайта. Объявление
+    # с сайта, пока оно есть, показывается вместо неё — у новости срок годности,
+    # у контактов его нет. Пусто — строки не будет вовсе.
+    "footer_text": "Вопросы и пожелания: Telegram @rabbiecho · sevdev.ru",
+    "footer_url": "https://t.me/rabbiecho",
     "display_mode": "overlay",   # "overlay" — поверх области, "panel" — окном с текстом
     "auto_copy": True,
     "font_size": 14,            # кегль в режиме "panel" и в тексте окна
@@ -496,21 +501,37 @@ def _promo_path():
     return data_file("promo_cache.json")
 
 
+def _footer_line():
+    """Постоянная подпись из настроек: контакты автора. Или None."""
+    text = " ".join(str(CFG.get("footer_text", "") or "").split())
+    if not text:
+        return None
+    url = str(CFG.get("footer_url", "") or "").strip()
+    if not url.lower().startswith(("http://", "https://")):
+        url = ""
+    return text[:PROMO_LIMIT], url
+
+
 def promo_line():
     """Что показывать сейчас: (текст, ссылка) или None.
+
+    Объявление с сайта — временное: у него есть срок, и когда он вышел или
+    сайта нет вовсе, остаётся постоянная подпись с контактами. Держать контакты
+    только на сайте нельзя: человек с готовым архивом должен видеть, куда
+    писать, даже если сайт лежит или ещё не поднят.
 
     Ссылку берём только http(s): в файле с чужого сервера может оказаться что
     угодно, а открывать по щелчку локальные пути программа не должна.
     """
     data = _promo.get("data")
     if not isinstance(data, dict):
-        return None
+        return _footer_line()
     text = " ".join(str(data.get("text") or "").split())
     if not text:
-        return None
+        return _footer_line()
     until = str(data.get("until") or "").strip()
     if until and time.strftime("%Y-%m-%d") > until:
-        return None                       # срок показа вышел
+        return _footer_line()             # срок показа вышел
     url = str(data.get("url") or "").strip()
     if not url.lower().startswith(("http://", "https://")):
         url = ""

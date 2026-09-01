@@ -54,7 +54,7 @@ SHIPPED_GLOBS = ["ui_*.json"]
 # ней есть, и единственное, что нельзя восстановить из готового .exe за вечер.
 # Остальные три ему просто не нужны: он не собирает и не рекламирует.
 PRIVATE_SECTIONS = [
-    "### Строка объявления",
+    "### Строка внизу окна: контакты и объявления",
     "## Запуск из исходников",
     "## Сборка .exe",
     "## Как устроено",
@@ -356,7 +356,7 @@ def public_readme(text):
             if line.rstrip() in PRIVATE_SECTIONS:
                 skip_level = level
         # строки таблицы настроек про рекламную полосу — это тоже наша кухня
-        if skip_level is None and not line.startswith("| `promo_"):
+        if skip_level is None and not line.startswith(("| `promo_", "| `footer_")):
             out.append(line)
     text = "".join(out)
     while "\n\n\n" in text:                       # после вырезанных разделов
