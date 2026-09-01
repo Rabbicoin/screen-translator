@@ -412,9 +412,25 @@ def folder_size(path):
     return total
 
 
+def app_version():
+    """Номер версии берём из самой программы, читая исходник.
+
+    Импортировать модуль ради одной строки нельзя: при импорте он читает
+    настройки и тянет за собой все библиотеки. Дата — запасной вариант,
+    если константу когда-нибудь переименуют.
+    """
+    try:
+        with open(os.path.join(HERE, "screen_translator.py"), encoding="utf-8") as f:
+            m = re.search(r'^APP_VERSION\s*=\s*"([^"]+)"', f.read(), re.M)
+        if m:
+            return m.group(1)
+    except OSError:
+        pass
+    return datetime.date.today().isoformat()
+
+
 def make_zip():
-    stamp = datetime.date.today().isoformat()
-    base = os.path.join(DIST, f"ScreenTranslator-{stamp}")
+    base = os.path.join(DIST, f"ScreenTranslator-{app_version()}")
     for old in glob.glob(base + ".zip"):
         os.remove(old)
     say("упаковываю архив (это дольше всего)…")

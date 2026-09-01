@@ -11,6 +11,11 @@ Screen Translator — экранный переводчик в стиле Google
     Esc         — закрыть выделение / окно перевода
 """
 
+# Номер версии живёт здесь и больше нигде: отсюда его берёт подсказка у иконки
+# в трее, пункт меню и имя архива при сборке. Без него по отчёту об ошибке
+# невозможно понять, какая у человека сборка.
+APP_VERSION = "1.0.1"
+
 import ctypes
 import glob
 import html
@@ -3825,8 +3830,12 @@ class App:
                              checked=lambda item: autostart_enabled()),
             pystray.MenuItem(lambda _: tr("settings"), lambda: os.startfile(CONFIG_PATH)),
             pystray.MenuItem(lambda _: tr("quit"), self.quit),
+            pystray.Menu.SEPARATOR,
+            # Без перевода: «v1.0.1» читается на любом языке интерфейса.
+            pystray.MenuItem(f"v{APP_VERSION}", None, enabled=False),
         )
-        self.tray = pystray.Icon("screen_translator", icon_img, "Экранный переводчик", menu)
+        self.tray = pystray.Icon("screen_translator", icon_img,
+                                 f"Экранный переводчик {APP_VERSION}", menu)
         threading.Thread(target=self.tray.run, daemon=True).start()
 
     def _lang_menu(self, pystray):
