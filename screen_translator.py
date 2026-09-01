@@ -135,7 +135,7 @@ DEFAULT_CONFIG = {
     # с сайта, пока оно есть, показывается вместо неё — у новости срок годности,
     # у контактов его нет. Пусто — строки не будет вовсе.
     "footer_text": "Вопросы и пожелания: Telegram @rabbiecho · sevdev.ru",
-    "footer_url": "https://t.me/rabbiecho",
+    "footer_url": "https://sevdev.ru",
     "display_mode": "overlay",   # "overlay" — поверх области, "panel" — окном с текстом
     "auto_copy": True,
     "font_size": 14,            # кегль в режиме "panel" и в тексте окна
