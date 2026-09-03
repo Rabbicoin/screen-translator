@@ -11,6 +11,30 @@
 Распознавание работает локально через Tesseract — снимки экрана никуда не уходят.
 В сеть отправляется только распознанный текст — в сервис перевода.
 
+## In English
+
+**Screen Translator** draws the translation directly over the text on your screen
+and keeps the original layout: tables stay tables, button labels stay on buttons.
+You can use the result, not just read it — you still see what to click.
+
+Press `Ctrl+Alt+Z` and drag a selection; the translated text appears in place.
+`Ctrl+Alt+X` translates the clipboard — plain text or a copied image.
+
+- Windows 10 or 11, 64-bit. Nothing else to install: Python, Tesseract and
+  22 recognition languages are bundled.
+- Text recognition runs **locally**. Only the recognised text leaves your
+  machine, and only to the translation service.
+- Free, no ads, no account. A DeepL or Google Cloud key is optional and
+  removes the rate limits of the public endpoints.
+- The interface follows the language you translate into; English and Russian
+  are built in, the rest are translated once and cached.
+
+**[Download for Windows](https://github.com/Rabbicoin/screen-translator/releases/latest)**
+· [Website with a video](https://sevdev.ru/en/apps/screen-translator)
+
+The rest of this document is in Russian — it is the full manual, from the
+config file to how the overlay is rendered.
+
 ## Установка
 
 Ничего доустанавливать не нужно: Python, Tesseract и языки распознавания уже
