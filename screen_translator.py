@@ -14,7 +14,7 @@ Screen Translator — экранный переводчик в стиле Google
 # Номер версии живёт здесь и больше нигде: отсюда его берёт подсказка у иконки
 # в трее, пункт меню и имя архива при сборке. Без него по отчёту об ошибке
 # невозможно понять, какая у человека сборка.
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 import ctypes
 import glob
@@ -2935,6 +2935,7 @@ class ResultWindow:
         self.show_text = image is None
         self.text_kind = "trans"           # какой текст показываем: "trans" или "orig"
         self._drag_from = None
+        self._text_dragging = False   # тянут окно за пустое место в тексте
         # пересборка картинки с другим увеличением; None — если перевод текстовый
         self.rerender = rerender
         # перевод того же снимка на другой язык; None — если пересчитывать нечего
@@ -2976,6 +2977,11 @@ class ResultWindow:
 
         self.body = tk.Frame(self.win, bg=theme()["bg"])
         self.body.pack(fill="both", expand=True)
+        # Поля вокруг содержимого — тоже место, за которое тянут окно.
+        # Заголовка у этого окна нет, и хвататься больше не за что.
+        self.body.bind("<ButtonPress-1>", self._press)
+        self.body.bind("<B1-Motion>", self._move)
+        self.body.bind("<ButtonRelease-1>", self._drop)
 
         self._build()
         ResultWindow._open.append(self)
@@ -3065,6 +3071,11 @@ class ResultWindow:
             self.text_widget = text
             # колесо здесь листает текст, поэтому кегль — на Ctrl+колесо
             text.bind("<Control-MouseWheel>", self._wheel)
+            # За текст окно не потащишь: там левой кнопкой выделяют. Зато
+            # пустое место под текстом и справа от строк ничем не занято.
+            text.bind("<ButtonPress-1>", self._text_press)
+            text.bind("<B1-Motion>", self._text_motion)
+            text.bind("<ButtonRelease-1>", self._text_drop)
         width = vw + 20
 
         bar = tk.Frame(self.body, bg=c["bar"], height=32)
@@ -3551,6 +3562,37 @@ class ResultWindow:
         self.x = wx + event.x_root - sx
         self.y = wy + event.y_root - sy
         self.win.geometry(f"+{int(self.x)}+{int(self.y)}")
+
+    def _text_press(self, event):
+        """Нажатие в тексте: пустое место двигает окно, сам текст — выделяется.
+
+        У окна нет заголовка, и в режиме картинки его таскают прямо за картинку.
+        В тексте так нельзя: левая кнопка там выделяет. Но ниже последней строки
+        и правее её конца текста нет — за это пустое поле и тянут, ожидая, что
+        окно поедет.
+        """
+        w = event.widget
+        pos = w.index(f"@{event.x},{event.y}")
+        self._text_dragging = (w.compare(pos, ">=", "end-1c")
+                               or w.compare(pos, "==", f"{pos} lineend"))
+        if self._text_dragging:
+            w.focus_set()          # иначе Ctrl+C и Ctrl+A перестанут доходить
+            self._press(event)
+            return "break"         # выделению начаться не даём
+        return None
+
+    def _text_motion(self, event):
+        if self._text_dragging:
+            self._move(event)
+            return "break"
+        return None
+
+    def _text_drop(self, event):
+        if self._text_dragging:
+            self._text_dragging = False
+            self._drop(event)
+            return "break"
+        return None
 
     def _drop(self, event):
         """Кнопку отпустили — якорь перетаскивания больше не действителен."""
