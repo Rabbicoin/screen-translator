@@ -935,6 +935,16 @@ def ocr_lang_candidates(img):
         narrow = named if covered else []
         if narrow and "+".join(narrow) not in order:
             order.append("+".join(narrow))
+        # Иероглифы: набор из четырёх языков сразу читает ХУЖЕ одного — модели
+        # мешают друг другу. На сканированной инструкции «chi_sim» находит
+        # подписи, которых «chi_sim+chi_tra+jpn+kor» не видит, и тратит вдвое
+        # меньше времени. Поэтому языки этой письменности пробуем поодиночке, а
+        # общий набор оставляем следующей попыткой — на случай, когда
+        # определитель ошибся упрощённым вместо традиционного.
+        if script in CJK_SCRIPTS:
+            for one in SCRIPT_LANGS.get(script or "", []):
+                if one in have and one not in order:
+                    order.append(one)
         if "+".join(langs) not in order:
             order.append("+".join(langs))
     if fallback and fallback not in order:
