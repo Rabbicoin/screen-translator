@@ -1411,7 +1411,7 @@ def _ocr_lines(img):
                                  cyrillic_page)
             joined = " ".join(w["text"] for w in seg)
             ordered = list(reversed(seg)) if _is_rtl_text(joined) else seg
-            text = re.sub(r"\s+", " ", " ".join(w["text"] for w in ordered)).strip()
+            text = re.sub(r"[ \t]+", " ", join_words(ordered)).strip()
             text = BULLET_JUNK.sub("• ", text)
             if not text:
                 continue
@@ -1434,8 +1434,29 @@ def _ocr_lines(img):
     return out, [(gs / scale, ge / scale) for gs, ge in gaps], langs
 
 
+# Последний кусок — знаки препинания и буквы «полной ширины»: «，」）». Они тоже
+# пишутся без отбивки, и без них склейка ставила пробел перед каждой запятой.
 CJK_RANGES = ((0x1100, 0x11FF), (0x3000, 0x303F), (0x3040, 0x30FF), (0x3400, 0x4DBF),
-              (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF))
+              (0x4E00, 0x9FFF), (0xAC00, 0xD7AF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF))
+
+
+def join_words(words):
+    """Склеиваем слова строки в текст.
+
+    Между иероглифами пробела не ставим: в китайском и японском его нет, а
+    Tesseract отдаёт их отдельными кусками. С пробелами «支撑杆» превращалось в
+    «支撑 杆», а «安装说明» — в «安 明», и переводчик принимал разорванные слова
+    за отдельные: заголовок «инструкция по сборке» становился именем «An Ming».
+    """
+    out = ""
+    for word in words:
+        text = word["text"]
+        if not text:
+            continue
+        if out and not (_is_cjk(out[-1]) or _is_cjk(text[0])):
+            out += " "
+        out += text
+    return out
 
 
 def _is_cjk(ch):
@@ -2559,6 +2580,11 @@ def render_overlay(img, blocks, translations, zoom=None):
         # ширина места под неё.
         if block.get("lines", 1) > 1:
             right = min(right, x1)
+        # Вниз блок расти может, но не более чем на две своих высоты. Соседа
+        # снизу, который бы его остановил, может не оказаться вовсе: на скане
+        # мелкий текст под ним нередко не распознаётся, и тогда перевод
+        # разрастался на пустое место и затирал таблицу под собой.
+        bottom = min(bottom, y1 + 2 * (y1 - y0))
         column_right = x1
         near = 8 * (block.get("line_h") or 12)
         for other_idx, other in enumerate(blocks):
