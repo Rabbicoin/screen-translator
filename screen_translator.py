@@ -1453,7 +1453,11 @@ def join_words(words):
         text = word["text"]
         if not text:
             continue
-        if out and not (_is_cjk(out[-1]) or _is_cjk(text[0])):
+        # Пробел убираем, только когда иероглифы с обеих сторон. Иначе
+        # «3.» и «松开» слипались в «3.松开», маркер пункта переставал
+        # опознаваться (он требует пробела после себя), и соседние пункты
+        # склеивались в один абзац.
+        if out and not (_is_cjk(out[-1]) and _is_cjk(text[0])):
             out += " "
         out += text
     return out
@@ -2655,9 +2659,13 @@ def render_overlay(img, blocks, translations, zoom=None):
         target = band[len(band) // 2]["start"]             # band отсортирован
         for p in band:
             avail_w, avail_h = p["avail"]
+            # Медиана класса поправляет заниженную оценку, но поднимать блок
+            # заметно выше его собственного размера нельзя: абзац, попавший в
+            # один класс с заголовком, рисовался вдвое крупнее оригинала и
+            # накрывал собой то, что под ним.
+            start = min(target, int(p["start"] * 1.25)) if uniform else p["start"]
             p["size"] = _fit_text(draw, p["text"], avail_w, avail_h,
-                                  target if uniform else p["start"],
-                                  min_font, spacing)[0]
+                                  max(min_font, start), min_font, spacing)[0]
         if uniform:
             # Равняемся не на самый тесный блок, а на нижнюю шестую часть: одна
             # тесная карточка не должна мельчить остальные, ей текст обрежется
