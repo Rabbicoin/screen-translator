@@ -716,12 +716,12 @@ UI_STRINGS = {
     "settings":      ("Открыть настройки", "Open settings"),
     "copy_sel":      ("Копировать выделенное", "Copy selection"),
     "ocr_short":     ("авто", "auto"),
-    "ocr_tip":       ("Язык на экране: чем читать текст. Один язык вместо «авто» "
-                      "ускоряет распознавание вдвое, но текст на других языках "
-                      "перестаёт читаться",
-                      "Language on screen: what to read the text with. A single "
-                      "language instead of auto is twice as fast, but text in "
-                      "other languages stops being read"),
+    "ocr_tip":       ("ОДИН язык вместо «авто» ускоряет распознавание вдвое, "
+                      "но текст на других языках перестаёт читаться",
+                      "A SINGLE language instead of auto makes recognition twice "
+                      "as fast, but text in other languages stops being read"),
+    "cap_target":    ("язык перевода", "translate into"),
+    "cap_source":    ("язык текста", "text language"),
     "select_all":    ("Выделить всё", "Select all"),
     "quit":          ("Выход", "Exit the program"),
     "ocr_auto":      ("Определять автоматически", "Detect automatically"),
@@ -3216,6 +3216,30 @@ class ResultWindow:
                 Tooltip(b, tip)
             return b
 
+        def lang_button(txt, caption, cmd, tip=None):
+            """Кнопка языка с мелкой подписью снизу.
+
+            Две одинаковые с виду кнопки рядом легко перепутать: одна про то,
+            НА какой язык переводим, вторая — на каком языке текст на экране.
+            Подпись отвечает на этот вопрос, не заставляя наводить мышь.
+            """
+            box = tk.Frame(bar, bg=c["bar"], cursor="hand2")
+            box.pack(side="left")
+            top = tk.Label(box, text=txt, bg=c["bar"], fg=c["btn"],
+                           font=("Segoe UI", 10), padx=8)
+            top.pack(pady=(3, 0))
+            note = tk.Label(box, text=caption, bg=c["bar"], fg=c["dim"],
+                            font=("Segoe UI", 7), padx=8)
+            note.pack(pady=(0, 2))
+            parts = (box, top, note)
+            for w in parts:
+                w.bind("<Button-1>", lambda e: cmd())
+                w.bind("<Enter>", lambda e: [p.configure(bg=c["hover"]) for p in parts])
+                w.bind("<Leave>", lambda e: [p.configure(bg=c["bar"]) for p in parts])
+            if tip:
+                Tooltip(box, tip)
+            return box
+
         def mode_button(txt, active, cmd):
             # текущий режим подсвечен фоном, поэтому наведение на него ярче обычного
             return button(txt, cmd, fg=c["active_fg"] if active else c["btn"],
@@ -3246,18 +3270,18 @@ class ResultWindow:
                          bg=c["bar"], fg=c["dim"],
                          font=("Segoe UI", 10), padx=10, pady=6).pack(side="left")
             else:
-                self.target_btn = button(
+                self.target_btn = lang_button(
                     f'{globe_icon(bar)}  {target_title(str(CFG.get("target_lang", "ru")))}  ⌄',
-                    self._pick_target, padx=8, tip=tr("target_tip"))
+                    tr("cap_target"), self._pick_target, tip=tr("target_tip"))
 
         # Язык на экране — соседней кнопкой. В трее он был и раньше, но туда
         # никто не заглядывает, а выбор ходовой: в английской игре «ENG» вместо
         # «авто» ускоряет каждый снимок вдвое.
         self.source_btn = None
         if self.recapture is not None and not self._working:
-            self.source_btn = button(
+            self.source_btn = lang_button(
                 f'{ocr_short_title(CFG.get("ocr_langs", "auto"))}  ⌄',
-                self._pick_source, padx=8, tip=tr("ocr_tip"))
+                tr("cap_source"), self._pick_source, tip=tr("ocr_tip"))
 
         # ползунок крупности: в тексте — кегль шрифта, в картинке — масштаб оверлея.
         # Размера окна не касается, за него отвечает уголок.
