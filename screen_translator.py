@@ -826,22 +826,36 @@ def fetch_ui_language(lang, done=None):
 HIDDEN_OCR_LANGS = {"ukr"}
 
 # Названия для меню в трее. Коды Tesseract человеку ничего не говорят.
+# По-русски и по-английски, как и остальные надписи: на английском интерфейсе
+# список языков распознавания оставался русским.
 LANG_NAMES = {
-    "eng": "английский", "rus": "русский", "deu": "немецкий", "fra": "французский",
-    "spa": "испанский", "ita": "итальянский", "por": "португальский",
-    "nld": "нидерландский", "pol": "польский", "ces": "чешский", "tur": "турецкий",
-    "swe": "шведский", "dan": "датский", "nor": "норвежский", "fin": "финский",
-    "ron": "румынский", "hun": "венгерский", "vie": "вьетнамский",
-    "ind": "индонезийский", "ukr": "украинский", "bul": "болгарский",
-    "srp": "сербский", "kaz": "казахский", "bel": "белорусский",
-    "chi_sim": "китайский упрощённый", "chi_tra": "китайский традиционный",
-    "jpn": "японский", "kor": "корейский", "ara": "арабский", "fas": "персидский",
-    "urd": "урду", "heb": "иврит", "ell": "греческий", "tha": "тайский",
-    "hin": "хинди", "mar": "маратхи", "nep": "непальский", "ben": "бенгальский",
-    "tam": "тамильский", "tel": "телугу", "kan": "каннада", "mal": "малаялам",
-    "guj": "гуджарати", "pan": "панджаби", "ori": "ория", "sin": "сингальский",
-    "kat": "грузинский", "hye": "армянский", "amh": "амхарский", "khm": "кхмерский",
-    "lao": "лаосский", "mya": "бирманский",
+    "eng": ("английский", "English"), "rus": ("русский", "Russian"),
+    "deu": ("немецкий", "German"), "fra": ("французский", "French"),
+    "spa": ("испанский", "Spanish"), "ita": ("итальянский", "Italian"),
+    "por": ("португальский", "Portuguese"), "nld": ("нидерландский", "Dutch"),
+    "pol": ("польский", "Polish"), "ces": ("чешский", "Czech"),
+    "tur": ("турецкий", "Turkish"), "swe": ("шведский", "Swedish"),
+    "dan": ("датский", "Danish"), "nor": ("норвежский", "Norwegian"),
+    "fin": ("финский", "Finnish"), "ron": ("румынский", "Romanian"),
+    "hun": ("венгерский", "Hungarian"), "vie": ("вьетнамский", "Vietnamese"),
+    "ind": ("индонезийский", "Indonesian"), "ukr": ("украинский", "Ukrainian"),
+    "bul": ("болгарский", "Bulgarian"), "srp": ("сербский", "Serbian"),
+    "kaz": ("казахский", "Kazakh"), "bel": ("белорусский", "Belarusian"),
+    "chi_sim": ("китайский упрощённый", "Chinese simplified"),
+    "chi_tra": ("китайский традиционный", "Chinese traditional"),
+    "jpn": ("японский", "Japanese"), "kor": ("корейский", "Korean"),
+    "ara": ("арабский", "Arabic"), "fas": ("персидский", "Persian"),
+    "urd": ("урду", "Urdu"), "heb": ("иврит", "Hebrew"),
+    "ell": ("греческий", "Greek"), "tha": ("тайский", "Thai"),
+    "hin": ("хинди", "Hindi"), "mar": ("маратхи", "Marathi"),
+    "nep": ("непальский", "Nepali"), "ben": ("бенгальский", "Bengali"),
+    "tam": ("тамильский", "Tamil"), "tel": ("телугу", "Telugu"),
+    "kan": ("каннада", "Kannada"), "mal": ("малаялам", "Malayalam"),
+    "guj": ("гуджарати", "Gujarati"), "pan": ("панджаби", "Punjabi"),
+    "ori": ("ория", "Odia"), "sin": ("сингальский", "Sinhala"),
+    "kat": ("грузинский", "Georgian"), "hye": ("армянский", "Armenian"),
+    "amh": ("амхарский", "Amharic"), "khm": ("кхмерский", "Khmer"),
+    "lao": ("лаосский", "Lao"), "mya": ("бирманский", "Burmese"),
 }
 
 
@@ -909,11 +923,22 @@ def ocr_short_title(code):
     return tr("ocr_short") if not code or code.lower() == "auto" else code.upper()
 
 
+def lang_name(code):
+    """Название языка распознавания на языке интерфейса.
+
+    Правило то же, что у остальных надписей: русский — по-русски, всё
+    остальное — по-английски. Своей строки в ui_*.json у этих названий нет:
+    их полсотни, и качать их переводом ради выпадающего списка не стоит.
+    """
+    ru, en = LANG_NAMES.get(code, (code, code))
+    return ru if ui_lang().startswith("ru") else en
+
+
 def lang_title(code):
     """«eng+rus» -> «Английский + русский», «auto» -> «Определять автоматически»."""
     if not code or code == "auto":
         return tr("ocr_auto")
-    names = [LANG_NAMES.get(part, part) for part in code.split("+")]
+    names = [lang_name(part) for part in code.split("+")]
     title = " + ".join(names)
     return title[:1].upper() + title[1:]
 
