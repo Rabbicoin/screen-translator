@@ -1320,7 +1320,7 @@ def _ocr_lines(img):
             # Windows они в cp1251 — настоящая ошибка тонет в этом падении
             raise RuntimeError(f"Tesseract не смог прочитать языки «{langs}». "
                                f"Проверьте, что они установлены.")
-        found, dropped = {}, 0
+        found, weak, dropped = {}, {}, 0
         for i in range(len(data["text"])):
             word = (data["text"][i] or "").strip()
             try:
@@ -1329,15 +1329,32 @@ def _ocr_lines(img):
                 conf = -1.0
             if not word:
                 continue
-            if conf < 40:
+            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+            x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            box = {"x0": x, "y0": y, "x1": x + w, "y1": y + h,
+                   "text": word, "conf": conf}
+            if conf >= 40:
+                found.setdefault(key, []).append(box)
+            elif conf >= 10:
+                weak.setdefault(key, []).append(box)      # решим после
+            else:
                 # Tesseract что-то здесь видит, но прочитать не может — обычно
                 # это текст на письменности, которой нет в наборе
                 dropped += 1
-                continue
-            key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-            x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
-            found.setdefault(key, []).append({"x0": x, "y0": y, "x1": x + w, "y1": y + h,
-                                              "text": word, "conf": conf})
+
+        # Слово с низкой оценкой посреди уверенно прочитанной строки — почти
+        # наверняка настоящий текст: помехи от картинок и рамок стоят сами по
+        # себе, а не внутри фразы. В игровом диалоге «I will restore the power»
+        # Tesseract читал «I» как палку и ронял оценку и ей, и слову «will» до
+        # 11 при 96 у соседей — обе выбрасывались, и от реплики оставалось
+        # «restore the power».
+        for key, words in weak.items():
+            neighbours = found.get(key)
+            if neighbours and max(w["conf"] for w in neighbours) >= 60:
+                neighbours.extend(words)
+                neighbours.sort(key=lambda w: w["x0"])
+            else:
+                dropped += len(words)
         return found, sum(len(v) for v in found.values()), dropped
 
     # Один проход не всегда справляется: письменность могла определиться неверно,
