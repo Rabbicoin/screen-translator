@@ -715,6 +715,13 @@ UI_STRINGS = {
     "autostart":     ("Запускать при включении компьютера", "Run at startup"),
     "settings":      ("Открыть настройки", "Open settings"),
     "copy_sel":      ("Копировать выделенное", "Copy selection"),
+    "ocr_short":     ("авто", "auto"),
+    "ocr_tip":       ("Язык на экране: чем читать текст. Один язык вместо «авто» "
+                      "ускоряет распознавание вдвое, но текст на других языках "
+                      "перестаёт читаться",
+                      "Language on screen: what to read the text with. A single "
+                      "language instead of auto is twice as fast, but text in "
+                      "other languages stops being read"),
     "select_all":    ("Выделить всё", "Select all"),
     "quit":          ("Выход", "Exit the program"),
     "ocr_auto":      ("Определять автоматически", "Detect automatically"),
@@ -879,6 +886,27 @@ def globe_icon(widget):
 def target_title(code):
     """«de» -> «Deutsch». Незнакомый код показываем как есть."""
     return TARGET_NAMES.get(code, code)
+
+
+def ocr_lang_choices():
+    """Языки на выбор для распознавания: «авто», потом самые ходовые, потом
+    остальные установленные по алфавиту."""
+    have = available_ocr_langs() - {"osd"} - HIDDEN_OCR_LANGS
+    codes = ["auto"]
+    for code in ("eng", "rus"):
+        if code in have:
+            codes.append(code)
+    if {"eng", "rus"} <= have:
+        codes.append("eng+rus")
+    codes += [c for _, c in sorted((lang_title(c), c) for c in have
+                                   if c not in ("eng", "rus"))]
+    return codes
+
+
+def ocr_short_title(code):
+    """Короткая подпись для кнопки: «авто», «ENG», «ENG+RUS»."""
+    code = str(code or "auto").strip()
+    return tr("ocr_short") if not code or code.lower() == "auto" else code.upper()
 
 
 def lang_title(code):
@@ -3014,7 +3042,7 @@ class ResultWindow:
 
     def __init__(self, root, screen_xy, image=None, translated="", original="",
                  rerender=None, retranslate=None, on_target=None, on_theme=None,
-                 post=None):
+                 recapture=None, post=None):
         self.root = root
         self.translated = translated
         self.original = original
@@ -3030,6 +3058,9 @@ class ResultWindow:
         self.retranslate = retranslate
         self.on_target = on_target
         self.on_theme = on_theme
+        # пересчитать ТОТ ЖЕ снимок заново — нужно при смене языка на экране:
+        # блоки, прочитанные прежним языком, для нового не годятся
+        self.recapture = recapture
         # Готовое из фонового потока возвращаем в поток окна: Tk не терпит
         # обращений со стороны, и after() оттуда молча не срабатывает.
         self.post = post or (lambda fn, *a: fn(*a))
@@ -3219,6 +3250,15 @@ class ResultWindow:
                     f'{globe_icon(bar)}  {target_title(str(CFG.get("target_lang", "ru")))}  ⌄',
                     self._pick_target, padx=8, tip=tr("target_tip"))
 
+        # Язык на экране — соседней кнопкой. В трее он был и раньше, но туда
+        # никто не заглядывает, а выбор ходовой: в английской игре «ENG» вместо
+        # «авто» ускоряет каждый снимок вдвое.
+        self.source_btn = None
+        if self.recapture is not None and not self._working:
+            self.source_btn = button(
+                f'{ocr_short_title(CFG.get("ocr_langs", "auto"))}  ⌄',
+                self._pick_source, padx=8, tip=tr("ocr_tip"))
+
         # ползунок крупности: в тексте — кегль шрифта, в картинке — масштаб оверлея.
         # Размера окна не касается, за него отвечает уголок.
         if self.show_text or self.rerender is not None:
@@ -3352,13 +3392,21 @@ class ResultWindow:
         return max(7, int(round(_clamp(CFG.get("font_size", 14), 6, 40, 14) * self.scale)))
 
     def _pick_target(self):
-        """Список языков под кнопкой. Каждый назван на себе самом — так его
-        узнают при любом языке интерфейса."""
+        """Список языков перевода под кнопкой. Каждый назван на себе самом —
+        так его узнают при любом языке интерфейса."""
         codes = [code for code, _ in TARGET_LANGS]
         current = str(CFG.get("target_lang", "ru"))
         if current not in codes:
             codes.insert(0, current)
+        self._popup(codes, current, target_title, self.set_target, self.target_btn)
 
+    def _pick_source(self):
+        """То же самое, но для языка на экране."""
+        self._popup(ocr_lang_choices(), str(CFG.get("ocr_langs", "auto")),
+                    lang_title, self.set_source, self.source_btn)
+
+    def _popup(self, codes, current, title, choose, anchor):
+        """Выпадающий список под кнопкой — общий для обоих выборов языка."""
         c = theme()
         top = tk.Toplevel(self.win)
         top.overrideredirect(True)
@@ -3370,7 +3418,7 @@ class ResultWindow:
         per_col = 12                                 # длинный список кладём в колонки
         for i, code in enumerate(codes):
             active = code == current
-            cell = tk.Label(frame, text=target_title(code), anchor="w",
+            cell = tk.Label(frame, text=title(code), anchor="w",
                             bg=c["active"] if active else c["bg"],
                             fg=c["active_fg"] if active else c["btn"],
                             font=("Segoe UI", 10), padx=14, pady=4, cursor="hand2")
@@ -3379,10 +3427,9 @@ class ResultWindow:
             cell.bind("<Leave>", lambda e, w=cell, a=active:
                       w.configure(bg=c["active"] if a else c["bg"]))
             cell.bind("<Button-1>", lambda e, code=code: (top.destroy(),
-                                                          self.set_target(code)))
+                                                          choose(code)))
 
         top.update_idletasks()
-        anchor = self.target_btn
         x = anchor.winfo_rootx() if anchor else self.win.winfo_rootx()
         y = (anchor.winfo_rooty() if anchor else self.win.winfo_rooty()) - top.winfo_height() - 4
         mx, my, mw, mh = monitor_rect_at(x, y)
@@ -3393,6 +3440,19 @@ class ResultWindow:
         top.bind("<Escape>", lambda e: top.destroy())
         top.bind("<FocusOut>", lambda e: top.destroy())
         top.focus_force()
+
+    def set_source(self, code):
+        """Меняем язык на экране и пересчитываем тот же снимок заново.
+
+        Пересчитывать надо с распознавания: блоки, прочитанные прежним языком,
+        для нового не годятся. Зато переснимать экран не нужно — снимок цел.
+        """
+        if str(CFG.get("ocr_langs", "auto")) == code or self.recapture is None:
+            return
+        CFG["ocr_langs"] = code
+        save_config(CFG)
+        self.close()
+        self.recapture()
 
     def set_target(self, code):
         """Переводим этот же снимок на другой язык — не переснимая экран."""
@@ -3841,13 +3901,23 @@ class App:
                 f"отрисовка {time.perf_counter() - t0:.2f} с")
 
             self.post(self._show_result, toast, screen_xy, image, full, text, rerender,
-                      translate_all)
+                      translate_all, crop)
         except Exception as e:
             traceback.print_exc()
             self.post(self._show_error, toast, screen_xy, f'{tr("error")}: {e}')
 
+    def redo_capture(self, crop, screen_xy):
+        """Пересчитать тот же снимок заново — после смены языка на экране.
+
+        Переснимать экран не нужно: снимок остался в памяти, повторяется только
+        распознавание с переводом.
+        """
+        toast = Toast(self.root, tr("working"))
+        threading.Thread(target=self._work, args=(crop, screen_xy, toast),
+                         daemon=True).start()
+
     def _show_result(self, toast, screen_xy, image, translated, original, rerender=None,
-                     translate_all=None):
+                     translate_all=None, crop=None):
         toast.close()
         if CFG.get("auto_copy", True) and translated.strip():
             try:
@@ -3859,7 +3929,9 @@ class App:
         ResultWindow(self.root, screen_xy, image=image,
                      translated=translated, original=original, rerender=rerender,
                      retranslate=translate_all, on_target=self._apply_target,
-                     on_theme=self._set_theme, post=self.post)
+                     on_theme=self._set_theme, post=self.post,
+                     recapture=(lambda: self.redo_capture(crop, screen_xy))
+                     if crop is not None else None)
 
     def _show_error(self, toast, screen_xy, message):
         toast.close()
@@ -3979,15 +4051,7 @@ class App:
         заранее, честнее назвать его прямо — распознавание выходит вдвое
         быстрее и точнее.
         """
-        have = available_ocr_langs() - {"osd"} - HIDDEN_OCR_LANGS
-        codes = ["auto"]
-        for code in ("eng", "rus"):
-            if code in have:
-                codes.append(code)
-        if {"eng", "rus"} <= have:
-            codes.append("eng+rus")
-        codes += [c for _, c in sorted((lang_title(c), c) for c in have
-                                       if c not in ("eng", "rus"))]
+        codes = ocr_lang_choices()
 
         def item(code):
             return pystray.MenuItem(
