@@ -1417,8 +1417,9 @@ def _ocr_lines(img):
         segments.append(current)
 
         for seg in segments:
-            seg = fix_lookalikes(_strip_leading_icon(_strip_edge_junk(seg)),
-                                 cyrillic_page)
+            seg = fix_lookalikes(
+                _strip_leading_icon(_strip_edge_junk(fix_pipe_as_i(seg))),
+                cyrillic_page)
             joined = " ".join(w["text"] for w in seg)
             ordered = list(reversed(seg)) if _is_rtl_text(joined) else seg
             text = re.sub(r"[ \t]+", " ", join_words(ordered)).strip()
@@ -1526,6 +1527,24 @@ LIST_MARKER = re.compile(r"^\s*(?:\d{1,3}\s*[.)]|[•·▪◦‣*]|[-–—])(?=
 # Одиночная скобка, палка или косая — это рамка кнопки или плашки, попавшая в
 # распознавание, а не знак препинания: словом такое не бывает никогда.
 EDGE_JUNK_TOKEN = re.compile(r"^[|/\\[\](){}<>«»‹›]+$")
+
+
+def fix_pipe_as_i(seg):
+    """Возвращаем на место английское «I», прочитанное как палка.
+
+    Заглавная «I» без засечек — вертикальный штрих, и Tesseract постоянно
+    отдаёт её как «|». В игровом диалоге «I can open a safe route» становилось
+    «| can open…», подлежащее пропадало, а сама палка ещё и выбрасывалась как
+    рамка кнопки. От рамки букву отличает соседнее слово: за «I» идёт слово со
+    строчной буквы («will», «can», «am»), а за рамкой — надпись с заглавной
+    («| NEW )») или конец строки.
+    """
+    for i, word in enumerate(seg[:-1]):
+        if word["text"].strip() in ("|", "l", "1"):
+            nxt = seg[i + 1]["text"].lstrip()[:1]
+            if nxt.isascii() and nxt.isalpha() and nxt.islower():
+                word["text"] = "I"
+    return seg
 
 
 def _strip_edge_junk(seg):
@@ -1649,10 +1668,14 @@ def _strip_leading_icon(seg):
         gaps = sorted(b["x0"] - a["x1"] for a, b in zip(rest, rest[1:]))
         typical = gaps[len(gaps) // 2] if gaps else 0.25 * tall
         gap = rest[0]["x0"] - head["x1"]
-        # Уверенность — самый надёжный признак: настоящее короткое слово («In»,
-        # «A») Tesseract читает уверенно, а значок он не читает вовсе и выдаёт
-        # первое похожее — «©2», «19», «м’», «\\'» — с низкой оценкой.
-        unsure = head["conf"] < 65
+        # Низкая уверенность — признак значка, но сама по себе она слишком
+        # груба: короткое настоящее слово («I», «Is», «A») Tesseract читает
+        # так же неуверенно, и в игровом диалоге «I will restore the power»
+        # теряло подлежащее, а «Is there another way out?» — сказуемое.
+        # Поэтому по одной уверенности выбрасываем только то, в чём букв нет
+        # вовсе. Значок, прочитанный буквами, должен выделяться ещё и ростом
+        # или отрывом от текста.
+        unsure = head["conf"] < 65 and not any(ch.isalpha() for ch in text)
         taller = head["y1"] - head["y0"] > 1.3 * tall
         far = gap > max(2.0 * max(1.0, typical), 0.4 * tall)
         if not (unsure or taller or far):
