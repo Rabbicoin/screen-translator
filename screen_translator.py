@@ -768,18 +768,27 @@ def tr(key):
 
 
 def load_ui_language(lang):
-    """Достаём готовые надписи из файла рядом с настройками."""
-    if lang in _ui_cache or lang.startswith(("ru", "en")):
+    """Достаём готовые надписи из файла рядом с настройками.
+
+    Возвращаем True, только если в файле есть почти все нынешние надписи. Файл
+    мог остаться от прежней версии программы, где их было меньше, — и тогда
+    новые пункты говорили бы по-английски навсегда: докачивать было бы нечего,
+    файл-то на месте. Найденное всё равно кладём в память: пусть до обновления
+    показывается хотя бы часть.
+    """
+    if lang.startswith(("ru", "en")):
         return True
-    try:
-        with open(_ui_path(lang), encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and data:
-            _ui_cache[lang] = data
-            return True
-    except Exception:
-        pass
-    return False
+    data = _ui_cache.get(lang)
+    if data is None:
+        try:
+            with open(_ui_path(lang), encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return False
+        if not isinstance(data, dict) or not data:
+            return False
+        _ui_cache[lang] = data
+    return len(set(data) & set(UI_STRINGS)) >= len(UI_STRINGS) * 0.9
 
 
 def fetch_ui_language(lang, done=None):
@@ -791,7 +800,7 @@ def fetch_ui_language(lang, done=None):
     чем с русского.
     """
     lang = (lang or "").lower()
-    if lang.startswith(("ru", "en")) or lang in _ui_cache or lang in _ui_pending:
+    if lang.startswith(("ru", "en")) or lang in _ui_pending:
         return
     if load_ui_language(lang):
         return
@@ -857,6 +866,11 @@ LANG_NAMES = {
     "amh": ("амхарский", "Amharic"), "khm": ("кхмерский", "Khmer"),
     "lao": ("лаосский", "Lao"), "mya": ("бирманский", "Burmese"),
 }
+
+# Названия языков — такие же надписи интерфейса, как «Продолжить» или «Выход».
+# Попадая в общий список, они переводятся на язык перевода тем же механизмом:
+# на иврите список языков оставался английским, потому что жил отдельно.
+UI_STRINGS.update({f"lang_{code}": names for code, names in LANG_NAMES.items()})
 
 
 # Языки перевода для меню. Сервисы знают их сотню, но в списке, который
@@ -924,14 +938,8 @@ def ocr_short_title(code):
 
 
 def lang_name(code):
-    """Название языка распознавания на языке интерфейса.
-
-    Правило то же, что у остальных надписей: русский — по-русски, всё
-    остальное — по-английски. Своей строки в ui_*.json у этих названий нет:
-    их полсотни, и качать их переводом ради выпадающего списка не стоит.
-    """
-    ru, en = LANG_NAMES.get(code, (code, code))
-    return ru if ui_lang().startswith("ru") else en
+    """Название языка распознавания на языке интерфейса."""
+    return tr(f"lang_{code}") if code in LANG_NAMES else code
 
 
 def lang_title(code):
