@@ -32,9 +32,23 @@ if errorlevel 1 (
 )
 
 echo.
-echo Отправляю:
+echo Отправляю версии:
 git log --oneline origin/main..HEAD
 echo.
+
+rem Метки версий (теги) - по ним на гитхабе делаются страницы релизов.
+rem Раньше кнопка их не отправляла, и метка новой версии оставалась на
+rem этом компьютере. Гитхаб тогда создавал свою - от того кода, что у него
+rem уже лежал, то есть от предыдущей версии. Релиз получался с начинкой
+rem от новой сборки и с исходником от старой.
+for /f "delims=" %%t in ('git tag') do (
+    git ls-remote --exit-code --tags origin "%%t" >nul 2>&1
+    if errorlevel 1 (
+        echo Новая метка версии: %%t
+        set "HAS_TAGS=1"
+    )
+)
+if defined HAS_TAGS echo.
 
 git push origin main
 if errorlevel 1 (
@@ -47,7 +61,18 @@ if errorlevel 1 (
 )
 
 echo.
-echo Готово. Посмотреть:
+git push origin --tags
+if errorlevel 1 (
+    echo.
+    echo Версии ушли, а метки - нет. Релиз на гитхабе делать рано:
+    echo без метки он привяжется не к тому коду. Покажите это окно автору.
+    echo.
+    pause
+    exit /b 1
+)
+
+echo.
+echo Готово - ушли и версии, и метки. Посмотреть:
 git remote get-url origin
 echo.
 pause
