@@ -799,6 +799,27 @@ UI_STRINGS = {
                       "enable the Cloud Translation API and create a key."),
     "key_pick":      ("Сначала выберите платный сервис в меню «Сервис перевода».",
                       "First pick a paid service in the «Translation service» menu."),
+    "menu_hotkeys":  ("Горячие клавиши…", "Keyboard shortcuts…"),
+    "hk_title":      ("Горячие клавиши", "Keyboard shortcuts"),
+    "hk_hint":       ("Щёлкните по сочетанию и нажмите новое — какое удобно.\n"
+                      "Нужен Ctrl, Alt или Win: одиночная клавиша перестала бы "
+                      "работать во всех остальных программах.",
+                      "Click a shortcut and press a new one — whatever suits you.\n"
+                      "Ctrl, Alt or Win is required: a bare key would stop working "
+                      "in every other program."),
+    "hk_press":      ("Нажмите клавиши…", "Press the keys…"),
+    "hk_need_mod":   ("Добавьте Ctrl, Alt или Win", "Add Ctrl, Alt or Win"),
+    "hk_taken":      ("Занято другой программой — возьмите другое",
+                      "Taken by another program — pick another one"),
+    "hk_same":       ("Это сочетание уже стоит на втором действии",
+                      "That shortcut is already used by the other action"),
+    "hk_bad_key":    ("Эту клавишу назначить нельзя", "This key cannot be assigned"),
+    "hk_saved":      ("Горячие клавиши сохранены", "Shortcuts saved"),
+    "hk_reset":      ("Вернуть обычные", "Reset to defaults"),
+    "hk_busy":       ("сочетание занято другой программой, поменяйте его: "
+                      "трей → Горячие клавиши",
+                      "this shortcut is taken by another program, change it: "
+                      "tray → Keyboard shortcuts"),
     "save":          ("Сохранить", "Save"),
     "cancel":        ("Отмена", "Cancel"),
 }
@@ -1135,7 +1156,7 @@ def set_autostart(enabled):
 #  Глобальные горячие клавиши (WinAPI RegisterHotKey — не зависит от раскладки)
 # --------------------------------------------------------------------------------------
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
-WM_HOTKEY = 0x0312
+WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
 
 VK_NAMES = {
     "space": 0x20, "tab": 0x09, "enter": 0x0D, "return": 0x0D, "esc": 0x1B, "escape": 0x1B,
@@ -1172,42 +1193,121 @@ def parse_hotkey(text):
     return mods, vk
 
 
-def register_global_hotkeys(mapping):
-    """Регистрируем хоткеи и крутим очередь сообщений в фоновом потоке."""
-    user32 = ctypes.windll.user32
-    user32.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_uint, ctypes.c_uint]
-    user32.RegisterHotKey.restype = ctypes.c_bool
+# Обратный перевод: код клавиши -> как она пишется в настройках. setdefault
+# оставляет первое имя из VK_NAMES, а синонимы там стоят в понятном порядке
+# («enter», а не «return»; «esc», а не «escape»).
+VK_TOKENS = {}
+for _vk_name, _vk_code in VK_NAMES.items():
+    VK_TOKENS.setdefault(_vk_code, _vk_name)
 
-    def loop():
+
+def vk_token(keycode):
+    """Код клавиши Windows -> кусок строки настройки: 'z', 'f3', 'space'.
+
+    Берём именно код, а не букву: код не зависит от раскладки. На русской
+    раскладке Tk назовёт клавишу «я», а Windows знает её как Z — и в настройках
+    должно лежать «z», иначе после перезапуска сочетание не соберётся обратно.
+    """
+    if 0x30 <= keycode <= 0x39 or 0x41 <= keycode <= 0x5A:
+        return chr(keycode).lower()
+    if 0x70 <= keycode <= 0x7B:
+        return f"f{keycode - 0x6F}"
+    return VK_TOKENS.get(keycode)
+
+
+def hotkey_is_free(text):
+    """Свободно ли сочетание: занимаем его на миг и тут же отпускаем.
+
+    Спросить «кто держит эту клавишу» Windows не даёт — только попробовать взять.
+    Наши собственные сочетания тоже покажутся занятыми: их держит другой поток,
+    так что перед проверкой их надо отсеивать самим.
+    """
+    if sys.platform != "win32":
+        return True
+    mods, vk = parse_hotkey(text)
+    if not vk:
+        return False
+    user32 = ctypes.windll.user32
+    probe = 0x4321                      # свой номер: рабочие идут с единицы
+    if not user32.RegisterHotKey(None, probe, mods | MOD_NOREPEAT, vk):
+        return False
+    user32.UnregisterHotKey(None, probe)
+    return True
+
+
+class HotkeySet:
+    """Занятые горячие клавиши: живут в своём потоке и умеют сняться.
+
+    Сочетание принадлежит потоку, который его занял, — снять его можно только
+    изнутри этого потока. Поэтому смена клавиш на ходу устроена так: положить
+    в очередь потока WM_QUIT, дождаться его ухода и завести новый набор.
+    """
+
+    def __init__(self, mapping, on_fail=None):
+        self.mapping = mapping
+        self.on_fail = on_fail
+        self.tid = None
+        self.ready = threading.Event()
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+        self.ready.wait(2.0)      # дальше зовущий уже может проверять занятость
+
+    def _loop(self):
         from ctypes import wintypes
-        handlers = {}
-        for hotkey_id, (text, callback) in enumerate(mapping.items(), start=1):
+        user32 = ctypes.windll.user32
+        user32.RegisterHotKey.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                          ctypes.c_uint, ctypes.c_uint]
+        user32.RegisterHotKey.restype = ctypes.c_bool
+        self.tid = ctypes.windll.kernel32.GetCurrentThreadId()
+        handlers, missed = {}, []
+        for hotkey_id, (text, callback) in enumerate(self.mapping.items(), start=1):
             mods, vk = parse_hotkey(text)
             if not vk:
                 print(f"  [!] не понял сочетание {text!r}")
+                missed.append(text)
                 continue
             if user32.RegisterHotKey(None, hotkey_id, mods | MOD_NOREPEAT, vk):
                 handlers[hotkey_id] = callback
                 log(f"зарегистрирован хоткей {text} (mods={mods}, vk={vk})")
             else:
-                print(f"  [!] сочетание {text} занято другой программой — "
-                      f"поменяйте hotkey в config.json")
+                print(f"  [!] сочетание {text} занято другой программой")
+                missed.append(text)
+        self.ready.set()
+        # сказать вслух: своего окна у программы нет, и без этого человек видит
+        # только «не реагирует на клавиши», а причины не видит нигде
+        if missed and self.on_fail:
+            try:
+                self.on_fail(missed)
+            except Exception:
+                traceback.print_exc()
         if not handlers:
             return
-        msg = wintypes.MSG()
-        while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
-            if msg.message == WM_HOTKEY:
-                log("нажат хоткей", msg.wParam)
-                handler = handlers.get(msg.wParam)
-                if handler:
-                    try:
-                        handler()
-                    except Exception:
-                        traceback.print_exc()
+        try:
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                if msg.message == WM_HOTKEY:
+                    log("нажат хоткей", msg.wParam)
+                    handler = handlers.get(msg.wParam)
+                    if handler:
+                        try:
+                            handler()
+                        except Exception:
+                            traceback.print_exc()
+        finally:
+            # уходим — отпускаем клавиши, иначе новый набор на них не встанет
+            for hotkey_id in handlers:
+                user32.UnregisterHotKey(None, hotkey_id)
 
-    thread = threading.Thread(target=loop, daemon=True)
-    thread.start()
-    return thread
+    def stop(self):
+        """Отпустить клавиши и дождаться, пока поток уйдёт."""
+        if self.tid:
+            ctypes.windll.user32.PostThreadMessageW(self.tid, WM_QUIT, 0, 0)
+        self.thread.join(2.0)
+
+
+def register_global_hotkeys(mapping, on_fail=None):
+    """Занять горячие клавиши. Возвращает набор, у которого есть .stop()."""
+    return HotkeySet(mapping, on_fail)
 
 
 # --------------------------------------------------------------------------------------
@@ -4045,6 +4145,7 @@ class App:
         self.tasks = queue.Queue()
         self.busy = False
         self.tray = None
+        self.hotkeys = None
         self._pump()
 
     # --- мост «фоновый поток -> главный поток Tk»
@@ -4231,16 +4332,33 @@ class App:
             CFG.get("hotkey_clipboard", "<ctrl>+<alt>+x"): lambda: self.post(self.translate_clipboard),
         }
         if sys.platform == "win32":
-            return register_global_hotkeys(mapping)
+            self.hotkeys = register_global_hotkeys(mapping, on_fail=self._hotkeys_failed)
+            return self.hotkeys
         try:
             from pynput import keyboard
             listener = keyboard.GlobalHotKeys(mapping)
             listener.daemon = True
             listener.start()
+            self.hotkeys = listener
             return listener
         except Exception as e:
             print("Не удалось зарегистрировать горячие клавиши:", e)
             return None
+
+    def _hotkeys_failed(self, missed):
+        """Клавиша не встала — сказать вслух. Зовут из чужого потока."""
+        names = ", ".join(self._pretty(text) for text in missed)
+        self.post(self._flash, f'{names} — {tr("hk_busy")}', 7)
+
+    def _apply_hotkeys(self):
+        """Перезанять клавиши по нынешним настройкам, без перезапуска программы."""
+        if self.hotkeys:
+            try:
+                self.hotkeys.stop()
+            except Exception:
+                traceback.print_exc()
+            self.hotkeys = None
+        self.start_hotkeys()
 
     # --- иконка в трее
     def start_tray(self):
@@ -4278,6 +4396,8 @@ class App:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda _: tr("autostart"), self._toggle_autostart,
                              checked=lambda item: autostart_enabled()),
+            pystray.MenuItem(lambda _: tr("menu_hotkeys"),
+                             lambda: self.post(self._ask_hotkeys)),
             pystray.MenuItem(lambda _: tr("settings"), lambda: os.startfile(CONFIG_PATH)),
             pystray.MenuItem(lambda _: tr("quit"), self.quit),
             pystray.Menu.SEPARATOR,
@@ -4444,6 +4564,156 @@ class App:
             b.bind("<Button-1>", lambda e, cmd=cmd: cmd())
         win.bind("<Return>", save)
         win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        mx, my, mw, mh = monitor_rect_at(win.winfo_pointerx(), win.winfo_pointery())
+        win.geometry("+%d+%d" % (mx + (mw - win.winfo_width()) // 2,
+                                 my + (mh - win.winfo_height()) // 2))
+        win.focus_force()
+
+    def _ask_hotkeys(self):
+        """Окно смены горячих клавиш: щёлкнул по сочетанию и нажал новое.
+
+        Клавишу запоминаем по коду (`event.keycode`), а не по букве: на русской
+        раскладке Tk назовёт её «я», а Windows знает ту же клавишу как Z, и в
+        настройках должно лежать «z». Одиночную клавишу назначить не даём:
+        занятая глобально, она перестанет работать во всех остальных программах.
+        """
+        c = theme()
+        win = tk.Toplevel(self.root)
+        win.title(tr("hk_title"))
+        win.configure(bg=c["bg"])
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+
+        tk.Label(win, text=tr("hk_title"), bg=c["bg"], fg=c["fg"],
+                 font=("Segoe UI", 12), pady=10).pack(padx=18)
+        tk.Label(win, text=tr("hk_hint"), bg=c["bg"], fg=c["dim"], justify="left",
+                 font=("Segoe UI", 9)).pack(padx=18, anchor="w")
+
+        actions = (("hotkey_capture", "menu_capture"), ("hotkey_clipboard", "menu_clip"))
+        picked = {name: str(CFG.get(name, DEFAULT_CONFIG[name])) for name, _ in actions}
+        ours = set(picked.values())     # эти держим мы сами, на занятость не проверяем
+        boxes, recording, held = {}, {"name": None}, set()
+
+        rows = tk.Frame(win, bg=c["bg"])
+        rows.pack(padx=18, pady=(12, 2), fill="x")
+        status = tk.Label(win, text="", bg=c["bg"], fg=c["dim"], font=("Segoe UI", 9))
+        status.pack(padx=18, anchor="w")
+
+        def show(name):
+            boxes[name].config(text=tr("hk_press") if recording["name"] == name
+                               else self._pretty(picked[name]))
+
+        def record(name):
+            recording["name"] = name
+            held.clear()                # прошлое нажатие могло отпуститься мимо окна
+            status.config(text="")
+            for other, _ in actions:
+                show(other)
+            win.focus_force()
+
+        for name, title in actions:
+            row = tk.Frame(rows, bg=c["bg"])
+            row.pack(fill="x", pady=3)
+            tk.Label(row, text=tr(title), bg=c["bg"], fg=c["fg"],
+                     font=("Segoe UI", 10)).pack(side="left")
+            # рамка: в светлой теме поле того же цвета, что и фон окна, и без
+            # неё не видно, что по сочетанию можно щёлкнуть
+            box = tk.Label(row, text=self._pretty(picked[name]), bg=c["entry"], fg=c["fg"],
+                           font=("Segoe UI", 10), padx=14, pady=5, width=18, cursor="hand2",
+                           highlightthickness=1, highlightbackground=c["line"])
+            box.pack(side="right", padx=(18, 0))
+            box.bind("<Button-1>", lambda e, name=name: record(name))
+            boxes[name] = box
+
+        mod_keys = {"Control_L": "ctrl", "Control_R": "ctrl", "Alt_L": "alt", "Alt_R": "alt",
+                    "Shift_L": "shift", "Shift_R": "shift", "Super_L": "win",
+                    "Super_R": "win", "Win_L": "win", "Win_R": "win"}
+
+        def on_press(e):
+            name = recording["name"]
+            if e.keysym in mod_keys:
+                held.add(mod_keys[e.keysym])    # Win в e.state не приходит вовсе
+                return "break" if name else None
+            if not name:
+                return None
+            mods = []
+            if e.state & 0x0004 or "ctrl" in held:
+                mods.append("ctrl")
+            if e.state & 0x20000 or "alt" in held:
+                mods.append("alt")
+            if e.state & 0x0001 or "shift" in held:
+                mods.append("shift")
+            if "win" in held:
+                mods.append("win")
+            token = vk_token(e.keycode)
+            if not token:
+                status.config(text=tr("hk_bad_key"))
+                return "break"
+            if not {"ctrl", "alt", "win"} & set(mods):
+                status.config(text=tr("hk_need_mod"))
+                return "break"
+            combo = "".join(f"<{m}>+" for m in mods) + token
+            other = [n for n, _ in actions if n != name][0]
+            if combo == picked[other]:
+                status.config(text=tr("hk_same"))
+                return "break"
+            if combo not in ours and not hotkey_is_free(combo):
+                status.config(text=tr("hk_taken"))
+                return "break"
+            picked[name] = combo
+            recording["name"] = None
+            show(name)
+            status.config(text="")
+            return "break"
+
+        def on_release(e):
+            held.discard(mod_keys.get(e.keysym, ""))
+
+        def save(*_):
+            if recording["name"]:           # сочетание ещё не нажали
+                return
+            changed = any(picked[n] != str(CFG.get(n, "")) for n, _ in actions)
+            for name, _ in actions:
+                self._save_setting(name, picked[name])
+            win.destroy()
+            if changed:
+                self._apply_hotkeys()
+                self._flash(tr("hk_saved"))
+
+        def reset(*_):
+            recording["name"] = None
+            for name, _ in actions:
+                picked[name] = DEFAULT_CONFIG[name]
+                show(name)
+            status.config(text="")
+
+        def escape(e):
+            if recording["name"]:      # Esc не назначаем: ею закрывают окно перевода
+                recording["name"] = None
+                for name, _ in actions:
+                    show(name)
+                return "break"
+            win.destroy()
+            return "break"
+
+        row = tk.Frame(win, bg=c["bg"])
+        row.pack(pady=(10, 14))
+        for text, cmd, fg, bg in ((tr("save"), save, c["accent_fg"], c["accent"]),
+                                  (tr("cancel"), win.destroy, c["btn"], c["hover_active"]),
+                                  (tr("hk_reset"), reset, c["dim"], c["bg"])):
+            b = tk.Label(row, text=text, bg=bg, fg=fg, font=("Segoe UI", 10),
+                         padx=20, pady=6, cursor="hand2")
+            b.pack(side="left", padx=6)
+            b.bind("<Button-1>", lambda e, cmd=cmd: cmd())
+
+        win.bind("<KeyPress>", on_press)
+        win.bind("<KeyRelease>", on_release)
+        # Enter и Esc разбираем отдельно: точное сочетание в Tk сильнее общего
+        # <KeyPress>, и без этого их нельзя было бы ни назначить, ни выйти
+        win.bind("<Return>", lambda e: on_press(e) if recording["name"] else save())
+        win.bind("<Escape>", escape)
 
         win.update_idletasks()
         mx, my, mw, mh = monitor_rect_at(win.winfo_pointerx(), win.winfo_pointery())
