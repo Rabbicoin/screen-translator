@@ -803,10 +803,14 @@ UI_STRINGS = {
     "hk_title":      ("Горячие клавиши", "Keyboard shortcuts"),
     "hk_hint":       ("Щёлкните по сочетанию и нажмите новое — какое удобно.\n"
                       "Нужен Ctrl, Alt или Win: одиночная клавиша перестала бы "
-                      "работать во всех остальных программах.",
+                      "работать во всех остальных программах.\n"
+                      "Исключение — F13…F24: их на обычной клавиатуре нет, и на них "
+                      "игровые клавиатуры вешают свои G-кнопки.",
                       "Click a shortcut and press a new one — whatever suits you.\n"
                       "Ctrl, Alt or Win is required: a bare key would stop working "
-                      "in every other program."),
+                      "in every other program.\n"
+                      "F13…F24 are the exception: a normal keyboard has no such keys, "
+                      "and gaming keyboards map their G-buttons to them."),
     "hk_press":      ("Нажмите клавиши…", "Press the keys…"),
     "hk_need_mod":   ("Добавьте Ctrl, Alt или Win", "Add Ctrl, Alt or Win"),
     "hk_taken":      ("Занято другой программой — возьмите другое",
@@ -1210,9 +1214,15 @@ def vk_token(keycode):
     """
     if 0x30 <= keycode <= 0x39 or 0x41 <= keycode <= 0x5A:
         return chr(keycode).lower()
-    if 0x70 <= keycode <= 0x7B:
-        return f"f{keycode - 0x6F}"
+    if 0x70 <= keycode <= 0x87:         # F1..F24: дальше F12 идут клавиши,
+        return f"f{keycode - 0x6F}"     # которых на обычной клавиатуре нет
     return VK_TOKENS.get(keycode)
+
+
+# Клавиши, которые не грех занять в одиночку: на обычной клавиатуре их нет,
+# и печатать ими нечего. Игровые клавиатуры вешают на них свои G-кнопки —
+# в родной программе клавиатуры G4 назначают, например, F13.
+SOLO_KEYS = {f"f{n}" for n in range(13, 25)}
 
 
 def hotkey_is_free(text):
@@ -4651,7 +4661,7 @@ class App:
             if not token:
                 status.config(text=tr("hk_bad_key"))
                 return "break"
-            if not {"ctrl", "alt", "win"} & set(mods):
+            if not {"ctrl", "alt", "win"} & set(mods) and token not in SOLO_KEYS:
                 status.config(text=tr("hk_need_mod"))
                 return "break"
             combo = "".join(f"<{m}>+" for m in mods) + token
