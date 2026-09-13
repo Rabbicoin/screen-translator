@@ -2631,7 +2631,22 @@ def is_translatable(text):
     каждый такой кусок отдельным запросом. На карточке товара с двумя десятками
     цен из этого набегало пять секунд ожидания на пустом месте.
     """
-    return sum(1 for ch in text if ch.isalpha()) >= 2
+    return sum(1 for ch in text if ch.isalpha()) >= 2 and not looks_like_code(text)
+
+
+def looks_like_code(text):
+    """Артикул или код: «EW-200», «IPX7», «WPA2-PSK», «USB».
+
+    Такое не переводят, но сервис всё равно «переводил»: «EW-200» на русском
+    выходило «РЭБ-200». А при переводе на английский коды возвращаются как
+    были и выглядели неудачей — их переспрашивали по одному.
+    Заглавные латинские буквы с цифрами или аббревиатура до трёх букв;
+    «SALE» и «STOP» — уже слова, их переводим.
+    """
+    letters = [c for c in text if c.isalpha()]
+    if not letters or not all(c.isascii() and c.isupper() for c in letters):
+        return False
+    return any(c.isdigit() for c in text) or len(letters) <= 3
 
 
 def _needs_retranslate(src, dst, target):
@@ -2650,7 +2665,9 @@ def _needs_retranslate(src, dst, target):
     # Для русского и английского можно проверить прямо: результат должен быть на
     # целевом языке. Для остальных такой проверки нет — довольствуемся
     # сравнением «вернулось как было».
-    if target in ("ru", "en") and not already_target(dst, target):
+    if target == "ru" and not is_russian(dst):
+        return True
+    if target == "en" and not is_ascii_latin(dst):
         return True
     return False
 
@@ -2689,8 +2706,10 @@ def translate_many(texts, target=None, source_hint=None):
         return [translate(texts[0], target, source_hint)[0]]
 
     parts = None
+    batch_lang = ""
     try:
-        result, _ = translate("\n@@@\n".join(texts), target, source_hint)
+        result, detected = translate("\n@@@\n".join(texts), target, source_hint)
+        batch_lang = str(detected or "").lower().split("-")[0]
         split = [p.strip() for p in re.split(r"\s*@\s*@\s*@\s*", result)]
         if len(split) == len(texts):
             parts = split
@@ -2700,8 +2719,14 @@ def translate_many(texts, target=None, source_hint=None):
     if parts is None:                      # маркер не пережил перевод
         parts = list(texts)
 
+    # Сервис сам сказал, что пакет уже на языке перевода, — значит, вернувшееся
+    # без изменений так и должно быть. Английский без сети по буквам не узнать
+    # (см. already_target), и без этой проверки английский экран, переводимый
+    # на английский, переспрашивался бы построчно.
+    same_lang = batch_lang == target
     retry = [i for i, (src, dst) in enumerate(zip(texts, parts))
-             if _needs_retranslate(src, dst, target)]
+             if _needs_retranslate(src, dst, target)
+             and not (same_lang and dst.strip() == src.strip())]
     if retry:
         log(f"до-переводим по одному: {len(retry)} из {len(texts)}")
 
@@ -2724,13 +2749,24 @@ def translate_many(texts, target=None, source_hint=None):
 
 
 def already_target(text, target):
-    """Этот кусок уже на нужном языке — трогать не надо."""
+    """Этот кусок уже на нужном языке — трогать не надо.
+
+    Проверка без сети, поэтому только там, где ответ виден по буквам: русский
+    узнаётся по кириллице. Английский так не узнать. Раньше английским считалась
+    любая латиница без значков — и «Technische Daten», «Nombre de la red», «Farbe»
+    при переводе на английский молча пропускались: переводились только строки,
+    где случайно попался умлаут или ударение. Что текст уже английский, теперь
+    говорит сам сервис перевода — см. translate_many.
+    """
     if target == "ru":
         return is_russian(text)
-    if target == "en":
-        letters = [c for c in text if c.isalpha()]
-        return bool(letters) and all(c.isascii() for c in letters)
     return False
+
+
+def is_ascii_latin(text):
+    """Все буквы — латиница без значков: так выглядит английский перевод."""
+    letters = [c for c in text if c.isalpha()]
+    return bool(letters) and all(c.isascii() for c in letters)
 
 
 # Кириллицей пишут не только по-русски. Казахское «Сәлеметсіз бе!» — кириллица,
@@ -4233,8 +4269,11 @@ class App:
                 log(f"перевод: {len(need)} блоков из {len(texts)} на «{target}»")
                 draw = None
                 if CFG.get("display_mode", "overlay") == "overlay" and blocks:
-                    to_draw = [done[i] if i in set(need) else ""
-                               for i in range(len(blocks))]
+                    # Вернувшееся без изменений не перерисовываем: это текст уже
+                    # на нужном языке или артикул, и поверх оригинала он лёг бы
+                    # тем же текстом, только чужим шрифтом.
+                    to_draw = [done[i] if i in set(need) and done[i].strip() != texts[i].strip()
+                               else "" for i in range(len(blocks))]
 
                     # то же самое, но с другим увеличением — для ползунка крупности
                     def draw(z, crop=crop, blocks=blocks, to_draw=to_draw):
