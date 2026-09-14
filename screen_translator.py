@@ -3195,6 +3195,44 @@ def render_overlay(img, blocks, translations, zoom=None):
 # --------------------------------------------------------------------------------------
 #  Окно выделения области
 # --------------------------------------------------------------------------------------
+def bring_to_foreground(win):
+    """Отдать окну клавиатуру, даже если программа сейчас в фоне.
+
+    Программа живёт в трее, и Windows не пускает фоновый процесс забрать фокус у
+    активного окна: focus_force() тихо не срабатывает, клавиши продолжают уходить
+    туда, где человек был до горячей клавиши. Мышь при этом работает — клик идёт в
+    окно под курсором, — поэтому поломка выглядела странно: выделять можно, а Esc
+    не закрывает. Обход: на миг подцепиться к очереди ввода активного окна — тогда
+    Windows считает нас его частью и фокус отдаёт.
+    """
+    try:
+        win.update_idletasks()
+        user32, kernel32 = ctypes.windll.user32, ctypes.windll.kernel32
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.GetWindowThreadProcessId.restype = ctypes.c_uint
+        user32.AttachThreadInput.argtypes = [ctypes.c_uint, ctypes.c_uint, ctypes.c_bool]
+        user32.AttachThreadInput.restype = ctypes.c_bool
+        user32.BringWindowToTop.argtypes = [ctypes.c_void_p]
+        user32.SetForegroundWindow.argtypes = [ctypes.c_void_p]
+
+        hwnd = int(win.wm_frame(), 16)
+        fg = user32.GetForegroundWindow()
+        fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+        my_tid = kernel32.GetCurrentThreadId()
+        attached = bool(fg_tid and fg_tid != my_tid
+                        and user32.AttachThreadInput(my_tid, fg_tid, True))
+        try:
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(my_tid, fg_tid, False)
+    except Exception:
+        pass
+    win.focus_force()
+
+
 class SelectionOverlay:
     """Замороженный снимок экрана на весь рабочий стол, на нём мышью выделяется область."""
 
@@ -3232,8 +3270,28 @@ class SelectionOverlay:
         self.win.bind("<Escape>", lambda e: self.cancel())
         self.win.bind("<Button-3>", lambda e: self.cancel())
 
-        self.win.focus_force()
+        self._closed = False
+        bring_to_foreground(self.win)
         self.canvas.focus_set()
+        self._watch_escape()
+
+    def _watch_escape(self):
+        """Esc отменяет выделение, даже если клавиатура осталась у другого окна.
+
+        Страховка к bring_to_foreground: спрашиваем у Windows само состояние
+        клавиши, а оно видно независимо от того, у кого фокус. Опрос живёт только
+        пока открыто выделение. Окну результата так нельзя: оно висит долго и
+        закрывалось бы от Esc, нажатого в любой другой программе.
+        """
+        if self._closed:
+            return
+        try:
+            if ctypes.windll.user32.GetAsyncKeyState(0x1B) & 0x8000:   # VK_ESCAPE
+                self.cancel()
+                return
+            self.win.after(30, self._watch_escape)
+        except Exception:
+            pass
 
     def _press(self, event):
         self.start = (event.x, event.y)
@@ -3275,6 +3333,7 @@ class SelectionOverlay:
         self.close()
 
     def close(self):
+        self._closed = True
         try:
             self.win.destroy()
         except Exception:
@@ -3737,7 +3796,7 @@ class ResultWindow:
         self.x, self.y = int(x), int(y)
         self.win.geometry(f"{w}x{h}+{self.x}+{self.y}")
         if focus:                       # при прокрутке колесом фокус не дёргаем
-            self.win.focus_force()
+            bring_to_foreground(self.win)
 
     def _viewport(self):
         """Размер области содержимого: задан уголком, при первой сборке — по содержимому."""
