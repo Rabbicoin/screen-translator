@@ -77,6 +77,15 @@ def day_text(day):
     return f"{day.day} {MONTHS[day.month - 1]}"
 
 
+def period_text(start, end):
+    """Дни, когда версия была самой свежей, коротко: «08.09», «15–24.09», «30.08–02.09»."""
+    if start.date() == end.date():
+        return f"{start:%d.%m}"
+    if start.month == end.month:
+        return f"{start:%d}–{end:%d.%m}"
+    return f"{start:%d.%m}–{end:%d.%m}"
+
+
 def fetch_releases():
     url = f"https://api.github.com/repos/{REPO}/releases?per_page=100"
     request = urllib.request.Request(url, headers={"User-Agent": "ScreenTranslator-stats"})
@@ -141,14 +150,15 @@ def page_data(versions, history, days, own, now):
     rows = []
     for i, v in enumerate(versions):
         nxt = versions[i + 1] if i + 1 < len(versions) else None
+        until = nxt["published"] if nxt else now
         rows.append({
             "version": v["version"],
-            "short": v["published"].strftime("%d.%m"),
+            "period": period_text(v["published"], until),
             "day": day_text(v["published"]),
             "time": v["published"].strftime("%H:%M"),
             "real": v["real"],
             "next": nxt["version"] if nxt else None,
-            "fresh": how_long((nxt["published"] if nxt else now) - v["published"]),
+            "fresh": how_long(until - v["published"]),
         })
     for d in days:
         d["fromText"] = day_text(dt.date.fromisoformat(d["from"]))
@@ -346,9 +356,10 @@ footer { color: var(--ink-2); font-size: 12px; margin-top: 16px; max-width: 680p
   <div class="tiles" id="tiles"></div>
 
   <section class="card">
-    <h2>Когда вышла версия и сколько её скачали</h2>
-    <p class="sub">Под каждым столбиком — дата выхода и номер версии. Наведите на
-      столбик: там видно, сколько времени версия была самой свежей.</p>
+    <h2>Сколько скачали каждую версию</h2>
+    <p class="sub">Под столбиком — дни, пока версия была самой свежей, и её номер.
+      Скачивания пришлись на эти дни, а на какой именно день — GitHub не сообщает.
+      У самой свежей версии это дни с её выхода по сегодня.</p>
     <div class="chart" id="by-version"></div>
     <details>
       <summary>Числа таблицей</summary>
@@ -475,7 +486,7 @@ function drawColumns(box, items, opts) {
   });
 
   // Какие подписи под осью оставить, чтобы не налезали друг на друга.
-  const every = Math.max(1, Math.ceil((opts.twoLineLabels ? 36 : 44) / slot));
+  const every = Math.max(1, Math.ceil((opts.twoLineLabels ? 66 : 44) / slot));
   const labelled = i => (items.length - 1 - i) % every === 0;
   const valueLabels = opts.allValues || slot >= 24;
 
@@ -557,7 +568,7 @@ else
 // ---------- По версиям ----------
 const versionItems = DATA.versions.map(v => ({
   value: v.real,
-  labels: [v.short, v.version],
+  labels: [v.period, v.version],
   tip: [times(v.real),
         `версия ${v.version}, вышла ${v.day} в ${v.time}`,
         v.next ? `была самой свежей ${v.fresh}, потом вышла ${v.next}`
