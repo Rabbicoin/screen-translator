@@ -9,11 +9,14 @@
 релиза их не показывает. Счётчик обновляется с задержкой, иногда до нескольких
 часов, — только что вышедшая версия может показать ноль.
 
-По дням GitHub не считает, у него только общий итог. Поэтому каждый запуск
-записывает текущие числа в downloads_history.json (за день одна запись —
-последняя), а скачивания за день — разница с предыдущей записью. Пропущенные дни
-сливаются в один отрезок. С ключом --quiet программа только записывает числа и
-обновляет страницу, ничего не показывая, — для запуска по расписанию.
+По дням GitHub не считает, у него только общий итог. Поэтому числа каждый вечер
+в 23:59 по Москве записывает сервер sevdev.ru (downloads_server.py), а программа
+забирает эти записи по SSH — настройки подключения в downloads_server.json рядом,
+вне истории версий. Всё вместе и сегодняшний запуск складываются в
+downloads_history.json (за день одна запись — последняя), скачивания за день —
+разница с предыдущей записью. Нет связи с сервером — считаем по одним своим
+запускам, пропущенные дни сливаются в один отрезок. С ключом --quiet программа
+только записывает числа и обновляет страницу, ничего не показывая.
 
 Проверочные скачивания при выпуске версий вычитаются: они записаны в
 downloads_self.json рядом (в историю версий не попадает). Уменьшить свой счётчик
@@ -23,12 +26,14 @@ GitHub не даёт, поэтому вычитаем здесь.
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 
 REPO = "Rabbicoin/screen-translator"
 HERE = os.path.dirname(os.path.abspath(__file__))
 SELF_FILE = os.path.join(HERE, "downloads_self.json")
+SERVER_FILE = os.path.join(HERE, "downloads_server.json")
 HISTORY_FILE = os.path.join(HERE, "downloads_history.json")
 PAGE_FILE = os.path.join(HERE, "Скачивания.html")
 
@@ -118,6 +123,36 @@ def load_history():
         return []
 
 
+def server_history():
+    """Записи, которые каждый вечер делает сервер: (записи, что пошло не так или None)."""
+    try:
+        with open(SERVER_FILE, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        return [], None   # сервер не настроен — считаем по своим запускам, это не ошибка
+    command = ["ssh", "-i", cfg["key"], "-o", "BatchMode=yes", "-o", "ConnectTimeout=15",
+               f"{cfg['user']}@{cfg['host']}", f"cat {cfg['file']}"]
+    try:
+        result = subprocess.run(command, capture_output=True, timeout=40)
+        if result.returncode != 0:
+            reason = result.stderr.decode("utf-8", "replace").strip()
+            return [], reason or f"ssh завершился с кодом {result.returncode}"
+        data = json.loads(result.stdout.decode("utf-8"))
+        return [e for e in data if isinstance(e, dict) and "date" in e and "counts" in e], None
+    except Exception as e:
+        return [], str(e)
+
+
+def merge(local, remote):
+    """За каждый день оставить более позднюю запись, при равном времени — серверную."""
+    by_date = {e["date"]: e for e in local}
+    for entry in remote:
+        mine = by_date.get(entry["date"])
+        if mine is None or entry.get("time", "") >= mine.get("time", ""):
+            by_date[entry["date"]] = entry
+    return sorted(by_date.values(), key=lambda e: e["date"])
+
+
 def save_snapshot(history, versions, now):
     """Дописать сегодняшние числа GitHub. За день хранится одна запись — последняя."""
     entry = {"date": now.strftime("%Y-%m-%d"), "time": now.strftime("%H:%M"),
@@ -146,7 +181,7 @@ def daily(history, own):
     return days
 
 
-def page_data(versions, history, days, own, now):
+def page_data(versions, history, days, server_error, now):
     rows = []
     for i, v in enumerate(versions):
         nxt = versions[i + 1] if i + 1 < len(versions) else None
@@ -175,7 +210,7 @@ def page_data(versions, history, days, own, now):
         "previous": ({"date": day_text(dt.date.fromisoformat(history[-2]["date"])),
                       "time": history[-2].get("time", "")} if len(history) > 1 else None),
         "days": days,
-        "ownSkipped": sum(own.values()),
+        "serverError": server_error,
     }
 
 
@@ -208,8 +243,8 @@ def print_table(versions, days, history):
         print(f"  С прошлого замера ({prev['date'][8:10]}.{prev['date'][5:7]}"
               f" в {prev.get('time', '')}) скачали: {days[-1]['added']}")
     else:
-        print("  Счёт по дням начат сегодня — со следующего запуска")
-        print("  в другой день будет видно, сколько скачали за это время.")
+        print("  Счёт по дням начат сегодня. Сервер записывает числа")
+        print("  каждый вечер в 23:59 — завтра будет видно, сколько скачали за день.")
     print()
     print("  Проверочные скачивания при выпуске версий не учтены.")
     print("  GitHub обновляет счётчик с задержкой: у свежей версии")
@@ -228,17 +263,22 @@ def main():
     now = dt.datetime.now().astimezone()
     own = own_downloads()
     versions = collect(releases, own)
-    history = load_history()
+    remote, server_error = server_history()
+    history = merge(load_history(), remote)
     try:
         history = save_snapshot(history, versions, now)
     except OSError as e:
         print("Не получилось записать замер:", e)
     days = daily(history, own)
 
-    write_page(page_data(versions, history, days, own, now))
+    write_page(page_data(versions, history, days, server_error, now))
     if quiet:
         return 0
     print_table(versions, days, history)
+    if server_error:
+        print()
+        print("  Не получилось забрать записи с сервера — по дням считаю")
+        print("  только по запускам на этом компьютере. Причина:", server_error)
     print()
     print("  График открыт в браузере — файл «Скачивания.html».")
     open_page()
@@ -369,9 +409,11 @@ footer { color: var(--ink-2); font-size: 12px; margin-top: 16px; max-width: 680p
 
   <section class="card">
     <h2>Скачивания по дням</h2>
-    <p class="sub" id="by-day-sub">Сколько раз скачали за день — разница между замерами.
-      Замер делается при каждом запуске «Скачивания.bat». Если в какие-то дни замеров
-      не было, число за них одно на весь отрезок — такой отрезок подсвечен бледной полосой.</p>
+    <p class="sub" id="by-day-sub">Каждый вечер в 23:59 по Москве сервер sevdev.ru
+      записывает числа GitHub, скачивания за день — разница между соседними записями.
+      Столбик «сегодня» — с прошлой записи до этого запуска, день ещё идёт. Если за
+      какие-то дни записей нет, число за них одно на весь отрезок — он подсвечен
+      бледной полосой.</p>
     <div class="chart" id="by-day"></div>
     <details id="by-day-details">
       <summary>Числа таблицей</summary>
@@ -546,7 +588,9 @@ function fillTable(table, head, rows) {
 
 // ---------- Шапка и плитки ----------
 document.getElementById("lead").textContent =
-  `Данные GitHub на ${DATA.updated}. Проверочные скачивания при выпуске версий не считаются.`;
+  `Данные GitHub на ${DATA.updated}. Проверочные скачивания при выпуске версий не считаются.` +
+  (DATA.serverError ? " Записи с сервера забрать не удалось — по дням видны только " +
+                      "запуски на этом компьютере." : "");
 
 const tiles = document.getElementById("tiles");
 function tile(label, value, note) {
@@ -616,8 +660,8 @@ if (DATA.days.length) {
   const box = document.getElementById("by-day");
   htmlEl("p", "empty",
     `Счёт по дням начат ${DATA.trackingSince}. GitHub помнит только общий итог, ` +
-    "поэтому числа записываются здесь, на компьютере, при каждом запуске «Скачивания.bat». " +
-    "Запустите его в другой день — и здесь появятся первые столбики.", box);
+    "поэтому числа каждый вечер в 23:59 записывает сервер sevdev.ru. " +
+    "Завтра здесь появится первый столбик.", box);
   document.getElementById("by-day-details").hidden = true;
 }
 
@@ -641,7 +685,7 @@ new ResizeObserver(() => {
 
 document.getElementById("footer").textContent =
   "GitHub обновляет счётчик с задержкой: у только что вышедшей версии первые часы может " +
-  "стоять ноль. Числа по дням записываются в downloads_history.json рядом с программой.";
+  "стоять ноль. Копия записей по дням — в downloads_history.json рядом с программой.";
 </script>
 </body>
 </html>

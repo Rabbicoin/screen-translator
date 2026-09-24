@@ -44,3 +44,7 @@ downloads_self.json
 downloads_history.json
 downloads_history.json.tmp
 Скачивания.html
+
+# Куда «Скачивания.bat» ходит за записями по дням: адрес сервера, пользователь и ключ.
+# Репозиторий открытый — адресу сервера там не место.
+downloads_server.json
