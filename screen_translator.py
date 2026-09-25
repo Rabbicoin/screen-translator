@@ -8,6 +8,7 @@ Screen Translator — экранный переводчик в стиле Google
 Горячие клавиши по умолчанию:
     Ctrl+Alt+Z  — выделить область и перевести
     Ctrl+Alt+X  — перевести текст из буфера обмена
+    Ctrl+Alt+D  — выделить область и пересчитать цены в другие валюты (currency.py)
     Esc         — закрыть выделение / окно перевода
 """
 
@@ -59,6 +60,10 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageGra
 
 import pytesseract
 from pytesseract import Output
+
+# Пересчёт цен живёт отдельно: у него своё распознавание и своя отрисовка, и
+# переводчик от него не зависит — см. начало currency.py.
+import currency
 
 # Собранная программа (.exe) держит код внутри служебной папки, поэтому
 # __file__ там ведёт не туда, где лежат файлы для человека — рядом с .exe.
@@ -122,6 +127,7 @@ def log(*args):
 DEFAULT_CONFIG = {
     "hotkey_capture": "<ctrl>+<alt>+z",
     "hotkey_clipboard": "<ctrl>+<alt>+x",
+    "hotkey_currency": "<ctrl>+<alt>+d",
     "target_lang": "ru",
     "translator": "free",       # "free" — публичные точки Google; "deepl"; "google_api"
     "api_key": "",              # ключ для платного сервиса; берётся в его личном кабинете
@@ -153,6 +159,9 @@ DEFAULT_CONFIG = {
     "overlay_min_font": 8,         # ниже не ужимаем: что не влезло, режем «…»
     "overlay_line_spacing": 1.25,  # межстрочный интервал; 1.1 экономит место
     "overlay_uniform_font": True,  # один кегль на весь текст, чтобы не прыгал
+    # --- пересчёт цен (Ctrl+Alt+D), см. currency.py
+    "currency_targets": [],        # в какие валюты; пусто — по языку перевода (₽ и $)
+    "currency_source": "auto",     # валюта на экране: "auto" — по знаку у цены, иначе код
 }
 
 
@@ -815,8 +824,8 @@ UI_STRINGS = {
     "hk_need_mod":   ("Добавьте Ctrl, Alt или Win", "Add Ctrl, Alt or Win"),
     "hk_taken":      ("Занято другой программой — возьмите другое",
                       "Taken by another program — pick another one"),
-    "hk_same":       ("Это сочетание уже стоит на втором действии",
-                      "That shortcut is already used by the other action"),
+    "hk_same":       ("Это сочетание уже стоит на другом действии",
+                      "That shortcut is already used by another action"),
     "hk_bad_key":    ("Эту клавишу назначить нельзя", "This key cannot be assigned"),
     "hk_saved":      ("Горячие клавиши сохранены", "Shortcuts saved"),
     "hk_reset":      ("Вернуть обычные", "Reset to defaults"),
@@ -826,7 +835,50 @@ UI_STRINGS = {
                       "tray → Keyboard shortcuts"),
     "save":          ("Сохранить", "Save"),
     "cancel":        ("Отмена", "Cancel"),
+    # --- пересчёт цен
+    "menu_currency": ("Пересчитать цены", "Convert prices"),
+    "cur_menu":      ("Валюты", "Currencies"),
+    "cur_show":      ("Показывать в валютах:", "Show in currencies:"),
+    "cur_source":    ("Валюта на экране", "Currency on screen"),
+    "cur_auto":      ("Определять по знаку у цены", "Detect from the price sign"),
+    "cap_cur_to":    ("в валюты", "convert to"),
+    "cap_cur_from":  ("валюта на экране", "screen currency"),
+    "cur_to_tip":    ("В какие валюты пересчитывать — можно отметить до трёх",
+                      "Currencies to convert into — pick up to three"),
+    "cur_from_tip":  ("«Авто» узнаёт валюту по знаку у цены. Выберите валюту сами, "
+                      "если знак спорный ($, ¥, kr) или его нет вовсе",
+                      "Auto recognizes the currency by the sign next to the price. "
+                      "Pick it yourself if the sign is ambiguous ($, ¥, kr) or missing"),
+    "cur_working":   ("Ищу цены…", "Looking for prices…"),
+    "cur_none":      ("Цен со знаком валюты не нашлось.\n"
+                      "Если знака нет или он необычный — выберите валюту кнопкой "
+                      "«валюта на экране» внизу.",
+                      "No prices with a currency sign were found.\n"
+                      "If there is no sign or it looks unusual, pick the currency "
+                      "with the «screen currency» button below."),
+    "cur_offline":   ("Не удалось получить курсы валют: нет связи с интернетом.",
+                      "Could not get exchange rates: no internet connection."),
+    "cur_stale":     ("Свежие курсы не скачались — посчитано по сохранённым.",
+                      "Fresh rates could not be downloaded — saved ones were used."),
+    "mode_list":     ("Списком", "As a list"),
+    "cur_old":       ("старая цена", "old price"),
+    "cur_picked":    ("валюта по вашему выбору", "currency as you picked"),
+    "cur_no_rate":   ("нет курса", "no rate"),
+    "cur_max":       ("Не больше трёх валют", "Up to three currencies"),
+    "cur_cbr":       ("Курс ЦБ РФ на", "Bank of Russia rate as of"),
+    "cur_cbr_short": ("ЦБ", "CBR"),
+    "cur_fb":        ("Курс currency-api на", "currency-api rate as of"),
+    "cur_fb_rest":   ("остальные валюты — по currency-api на",
+                      "other currencies — currency-api as of"),
+    "cur_thousand":  ("тыс.", "K"),
+    "cur_million":   ("млн", "M"),
+    "cur_billion":   ("млрд", "B"),
 }
+
+# Названия валют — такие же надписи, как названия языков: на других языках
+# интерфейса они переводятся вместе со всем остальным.
+UI_STRINGS.update({f"cur_{code}": (info[3], info[4])
+                   for code, info in currency.CURRENCIES.items()})
 
 _ui_cache = {}          # язык -> {ключ: перевод}
 _ui_pending = set()     # какие языки уже переводятся, чтобы не просить дважды
@@ -3469,8 +3521,11 @@ class ResultWindow:
 
     def __init__(self, root, screen_xy, image=None, translated="", original="",
                  rerender=None, retranslate=None, on_target=None, on_theme=None,
-                 recapture=None, post=None):
+                 recapture=None, post=None, prices=None):
         self.root = root
+        # Окно пересчёта цен: тот же вид, но вместо кнопок языка — кнопки валют.
+        # PriceSnapshot; None — это окно перевода.
+        self.prices = prices
         self.translated = translated
         self.original = original
         self.image = image                 # чётко отрисованная картинка
@@ -3684,7 +3739,8 @@ class ResultWindow:
         if self.original:
             mode_button(tr("mode_orig"), showing_orig, lambda: self.show_kind("orig"))
         if self.image is not None or self.original:
-            mode_button(tr("mode_trans"), self.show_text and not showing_orig,
+            mode_button(tr("mode_list") if self.prices else tr("mode_trans"),
+                        self.show_text and not showing_orig,
                         lambda: self.show_kind("trans"))
 
         # Выбор языка перевода прямо здесь: чаще всего он и нужен сразу после
@@ -3709,6 +3765,27 @@ class ResultWindow:
             self.source_btn = lang_button(
                 f'{ocr_short_title(CFG.get("ocr_langs", "auto"))}  ⌄',
                 tr("cap_source"), self._pick_source, tip=tr("ocr_tip"))
+
+        # В окне пересчёта цен на том же месте — валюты: в какие считаем и какая
+        # на экране. Устроены так же, как языки, чтобы не пришлось привыкать.
+        self.cur_to_btn = self.cur_from_btn = None
+        if self.prices is not None:
+            if self._working:
+                tk.Label(bar, text=tr("cur_working"), bg=c["bar"], fg=c["dim"],
+                         font=("Segoe UI", 10), padx=10, pady=6).pack(side="left")
+            else:
+                self.cur_to_btn = lang_button(
+                    f'{self.prices.targets_title()}  ⌄', tr("cap_cur_to"),
+                    self._pick_cur_to, tip=tr("cur_to_tip"))
+                self.cur_from_btn = lang_button(
+                    f'{self.prices.source_title()}  ⌄', tr("cap_cur_from"),
+                    self._pick_cur_from, tip=tr("cur_from_tip"))
+                note = self.prices.note_short()
+                if note:
+                    label = tk.Label(bar, text=note, bg=c["bar"], fg=c["faint"],
+                                     font=("Segoe UI", 8), padx=6, pady=6)
+                    label.pack(side="left")
+                    Tooltip(label, self.prices.note_long())
 
         # ползунок крупности: в тексте — кегль шрифта, в картинке — масштаб оверлея.
         # Размера окна не касается, за него отвечает уголок.
@@ -3856,8 +3933,11 @@ class ResultWindow:
         self._popup(ocr_lang_choices(), str(CFG.get("ocr_langs", "auto")),
                     lang_title, self.set_source, self.source_btn)
 
-    def _popup(self, codes, current, title, choose, anchor):
-        """Выпадающий список под кнопкой — общий для обоих выборов языка."""
+    def _popup(self, codes, current, title, choose, anchor, per_col=12):
+        """Выпадающий список под кнопкой — общий для обоих выборов языка.
+
+        `per_col` — сколько строк в колонке: длинный список кладём в колонки.
+        """
         c = theme()
         top = tk.Toplevel(self.win)
         top.overrideredirect(True)
@@ -3866,7 +3946,6 @@ class ResultWindow:
         frame = tk.Frame(top, bg=c["bg"])
         frame.pack(padx=1, pady=1)
 
-        per_col = 12                                 # длинный список кладём в колонки
         for i, code in enumerate(codes):
             active = code == current
             cell = tk.Label(frame, text=title(code), anchor="w",
@@ -3938,6 +4017,130 @@ class ResultWindow:
                             self._render_zoom = zoom
                         except Exception:
                             traceback.print_exc()
+                self._build(focus=False)
+
+            self.post(apply)
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # --- валюты в окне пересчёта цен
+    def _pick_cur_from(self):
+        """Валюта на экране: «авто» и список. Один выбор, как у языка на экране."""
+        self._popup(["auto"] + currency.CHOICES, currency_source(), currency_title,
+                    self._set_cur_source, self.cur_from_btn, per_col=16)
+
+    def _set_cur_source(self, code):
+        if code == currency_source() or self.prices is None:
+            return
+        self.prices.set_source(code)
+        self._recount()
+
+    def _pick_cur_to(self):
+        """В какие валюты считать: галочки, до трёх сразу.
+
+        Список не закрывается от щелчка — отмечают обычно две-три валюты
+        подряд. Пересчитываем, когда список закрыли, один раз за все отметки.
+        """
+        c = theme()
+        top = tk.Toplevel(self.win)
+        top.overrideredirect(True)
+        top.attributes("-topmost", True)
+        top.configure(bg=c["line"])
+        frame = tk.Frame(top, bg=c["bg"])
+        frame.pack(padx=1, pady=1)
+        chosen = list(currency_targets())
+        cells = {}
+        status = tk.Label(top, text="", bg=c["bg"], fg=c["dim"], font=("Segoe UI", 9),
+                          anchor="w", padx=14)
+
+        def paint(code):
+            on = code in chosen
+            cells[code].configure(text=("✓  " if on else "     ") + currency_title(code),
+                                  bg=c["active"] if on else c["bg"],
+                                  fg=c["active_fg"] if on else c["btn"])
+
+        def toggle(code):
+            if code in chosen:
+                if len(chosen) == 1:            # хоть одна валюта должна остаться
+                    return
+                chosen.remove(code)
+            elif len(chosen) >= currency.MAX_TARGETS:
+                status.configure(text=tr("cur_max"))
+                return
+            else:
+                chosen.append(code)
+            status.configure(text="")
+            paint(code)
+
+        def close(_=None):
+            try:
+                top.destroy()
+            except Exception:
+                pass
+            if chosen != currency_targets() and self.prices is not None:
+                self.prices.set_targets(chosen)
+                self._recount()
+
+        per_col = 16
+        for i, code in enumerate(currency.CHOICES):
+            cell = tk.Label(frame, anchor="w", font=("Segoe UI", 10), padx=14, pady=3,
+                            cursor="hand2")
+            cells[code] = cell
+            paint(code)
+            cell.grid(row=i % per_col, column=i // per_col, sticky="ew")
+            cell.bind("<Enter>", lambda e, w=cell: w.configure(bg=c["hover_active"]))
+            cell.bind("<Leave>", lambda e, code=code: paint(code))
+            cell.bind("<Button-1>", lambda e, code=code: toggle(code))
+        status.pack(fill="x", padx=1, pady=(0, 1))
+
+        top.update_idletasks()
+        anchor = self.cur_to_btn
+        x = anchor.winfo_rootx() if anchor else self.win.winfo_rootx()
+        y = (anchor.winfo_rooty() if anchor else self.win.winfo_rooty()) - top.winfo_height() - 4
+        mx, my, mw, mh = monitor_rect_at(x, y)
+        x = min(max(x, mx + 2), max(mx + 2, mx + mw - top.winfo_width() - 2))
+        if y < my + 2:
+            y = (anchor.winfo_rooty() + anchor.winfo_height() + 4) if anchor else my + 2
+        top.geometry("+%d+%d" % (int(x), int(y)))
+        top.bind("<Escape>", close)
+        top.bind("<FocusOut>", close)
+        top.focus_force()
+
+    def _recount(self):
+        """Пересчитать цены того же снимка с новыми валютами — без распознавания."""
+        if self.prices is None or self._working:
+            return
+        self._working = True
+        self._build(focus=False)
+
+        def work():
+            result = None
+            try:
+                text, draw = self.prices.compute()
+                image = draw(max(1.0, self.scale)) if draw else None
+                result = (text, draw, image)
+            except Exception:
+                traceback.print_exc()
+
+            def apply():
+                self._working = False
+                if result is not None:
+                    text, draw, image = result
+                    self.translated = text
+                    self.rerender = draw
+                    if image is not None:
+                        # цены нашлись впервые (раньше было «не нашлось») —
+                        # сразу показываем картинку, ради неё и выбирали валюту
+                        if self.image is None:
+                            self.show_text = False
+                        # третья валюта удлиняет подписи, и картинка шире прежней:
+                        # окно подстраиваем под неё, а не прячем хвост под прокрутку
+                        if self.image is None or self.image.size != image.size:
+                            self.win_w = self.win_h = None
+                        self.image = image
+                        self._render_zoom = max(1.0, self.scale)
+                    else:
+                        self.image, self.show_text = None, True
                 self._build(focus=False)
 
             self.post(apply)
@@ -4241,6 +4444,157 @@ class Toast:
 
 
 # --------------------------------------------------------------------------------------
+#  Пересчёт цен
+# --------------------------------------------------------------------------------------
+# Сам разбор цен, курсы и отрисовка — в currency.py. Здесь только то, что
+# связывает их с настройками, надписями интерфейса и окном результата.
+
+# Языки интерфейса, где дробную часть отделяют запятой: «$117,23», а не «$117.23».
+COMMA_LANGS = {"ru", "be", "kk", "uk", "de", "fr", "es", "it", "pt", "pl", "cs", "tr",
+               "nl", "sv", "id", "vi"}
+RATES_PATH = data_file("currency_rates.json")
+
+
+def currency_targets():
+    """В какие валюты пересчитываем: из настроек, а если там пусто — по языку перевода."""
+    saved = [c for c in (CFG.get("currency_targets") or []) if c in currency.CURRENCIES]
+    return saved[:currency.MAX_TARGETS] or currency.default_targets(CFG.get("target_lang", "ru"))
+
+
+def currency_source():
+    """Валюта на экране: "auto" или код. Мусор в config.json считаем за «auto»."""
+    code = str(CFG.get("currency_source", "auto") or "auto")
+    return code if code in currency.CURRENCIES else "auto"
+
+
+def currency_title(code):
+    """«SGD · Сингапурский доллар»; «auto» — «Определять по знаку у цены»."""
+    if code == "auto":
+        return tr("cur_auto")
+    return f"{code} · {tr(f'cur_{code}')}"
+
+
+def price_ocr_langs(img):
+    """Чем распознавать цены: тот же выбор языка, что у перевода, плюс английский.
+
+    Коды валют и знаки «$ € £» — латиница, поэтому английская модель в наборе
+    нужна всегда, даже на китайской странице.
+    """
+    prepared = preprocess(img, float(CFG.get("ocr_scale", 2.0) or 1.0))
+    parts = ocr_lang_candidates(prepared)[0].split("+")
+    if "eng" not in parts and "eng" in available_ocr_langs():
+        parts.insert(0, "eng")
+    return "+".join(parts)
+
+
+def _dmy(date):
+    """«2026-09-25» -> «25.09.2026»; «26.09.2026» остаётся как есть."""
+    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", date or "")
+    return f"{m.group(3)}.{m.group(2)}.{m.group(1)}" if m else (date or "")
+
+
+class PriceSnapshot:
+    """Распознанный снимок с ценами: всё, чтобы пересчитать заново без распознавания.
+
+    Смена валют в окне результата снимок не трогает: строки уже прочитаны,
+    меняется только разбор (другая валюта на экране) и подписи к ценам.
+    """
+
+    def __init__(self, crop, lines, rates, save):
+        self.crop = crop
+        self.lines = lines
+        self.rates = rates
+        self.save = save            # запись настройки: App._save_setting
+        self.found = 0
+        self.used = set()           # какие валюты участвовали в пересчёте
+
+    def targets_title(self):
+        return " + ".join(currency.symbol(c) for c in currency_targets())
+
+    def source_title(self):
+        code = currency_source()
+        return tr("ocr_short") if code == "auto" else code
+
+    def set_targets(self, codes):
+        self.save("currency_targets", list(codes))
+
+    def set_source(self, code):
+        self.save("currency_source", code)
+
+    def compute(self):
+        """Разобрать цены заново -> (текст списком, отрисовка(zoom) или None)."""
+        targets = currency_targets()
+        prices = currency.find_prices(self.lines, currency_source())
+        comma = ui_lang().split("-")[0] in COMMA_LANGS
+        short = (tr("cur_thousand"), tr("cur_million"), tr("cur_billion"))
+        labels, rows, used = [], [], set()
+        for p in prices:
+            parts = []
+            for t in targets:
+                if t == p.code:
+                    continue
+                value = self.rates.convert(p.amount, p.code, t)
+                if value is None:
+                    continue
+                parts.append(currency.fmt_amount(value, t, comma, short if p.short else None))
+                used.update((p.code, t))
+            if not parts:
+                # цена уже в единственной выбранной валюте — или курса нет вовсе
+                parts = [currency.fmt_amount(p.amount, p.code, comma) if p.code in targets
+                         else tr("cur_no_rate")]
+            label = " · ".join(parts)
+            labels.append(label)
+            notes = ([tr("cur_old")] if p.strike else []) + ([tr("cur_picked")] if p.weak else [])
+            rows.append(f"{p.text} → {label}" + (f"  ({', '.join(notes)})" if notes else ""))
+        self.found, self.used = len(prices), used
+        if not prices:
+            return tr("cur_none"), None
+        text = "\n".join(rows) + "\n\n" + self.note_long()
+        min_font = int(_clamp(CFG.get("overlay_min_font", 8), 6, 40, 8))
+
+        def draw(zoom, prices=prices, labels=labels):
+            # None — как у перевода: крупность из настройки overlay_zoom
+            if zoom is None:
+                zoom = _clamp(CFG.get("overlay_zoom", 1.0), 1.0, 3.0, 1.0)
+            return currency.render(self.crop, prices, labels, self.lines,
+                                   zoom=zoom, min_font=min_font)
+
+        return text, draw
+
+    def _parts(self):
+        """Откуда курсы, которыми считали: ("cbr" | "fb", дата)."""
+        kinds = {self.rates.source.get(c) for c in self.used if c != "RUB"}
+        if not kinds and self.used:
+            kinds = {"cbr"}               # пересчёт рубль ↔ рубль — считать нечего
+        out = []
+        if "cbr" in kinds and self.rates.cbr_date:
+            out.append(("cbr", self.rates.cbr_date))
+        if "fb" in kinds and self.rates.fb_date:
+            out.append(("fb", _dmy(self.rates.fb_date)))
+        return out
+
+    def note_long(self):
+        """«Курс ЦБ РФ на 26.09.2026; остальные валюты — по currency-api на 25.09.2026»."""
+        parts = self._parts()
+        text = "; ".join(
+            f'{tr("cur_cbr")} {date}' if kind == "cbr"
+            else f'{tr("cur_fb_rest") if i else tr("cur_fb")} {date}'
+            for i, (kind, date) in enumerate(parts))
+        if self.rates.stale:
+            text = (text + "\n" if text else "") + tr("cur_stale")
+        return text
+
+    def note_short(self):
+        """Подпись в полоске окна: «ЦБ · 26.09»."""
+        parts = self._parts()
+        if not parts:
+            return ""
+        kind, date = parts[0]
+        day = date[:5]
+        return f'{tr("cur_cbr_short")} · {day}' if kind == "cbr" else day
+
+
+# --------------------------------------------------------------------------------------
 #  Приложение
 # --------------------------------------------------------------------------------------
 class App:
@@ -4270,7 +4624,8 @@ class App:
         self.root.after(40, self._pump)
 
     # --- сценарий 1: выделение области
-    def start_capture(self):
+    def start_capture(self, on_area=None):
+        """Выделить область мышью. `on_area` — что делать с ней; по умолчанию переводить."""
         if self.busy:
             return
         self.busy = True
@@ -4283,8 +4638,9 @@ class App:
             self.busy = False
             print("Не удалось сделать снимок экрана:", e)
             return
+        handler = on_area or self._on_area
         SelectionOverlay(self.root, shot, (ox, oy),
-                         lambda box: self._on_area(shot, (ox, oy), box))
+                         lambda box: handler(shot, (ox, oy), box))
         log("окно выделения создано")
         self.root.after(200, lambda: setattr(self, "busy", False))
 
@@ -4428,6 +4784,63 @@ class App:
         log("буфер обмена пуст")
         self._flash(tr("clip_empty"))
 
+    # --- сценарий 3: пересчёт цен. Выделение то же, дальше — своя дорога,
+    # переводчик в ней не участвует (см. currency.py)
+    def start_currency(self):
+        self.start_capture(on_area=self._on_price_area)
+
+    def _on_price_area(self, shot, origin, box):
+        crop = shot.crop(box)
+        screen_xy = (origin[0] + box[0], origin[1] + box[1])
+        toast = Toast(self.root, tr("cur_working"))
+        threading.Thread(target=self._work_prices, args=(crop, screen_xy, toast),
+                         daemon=True).start()
+
+    def _work_prices(self, crop, screen_xy, toast):
+        try:
+            refresh_config()
+            fetch_promo()
+            t0 = time.perf_counter()
+            langs = price_ocr_langs(crop)
+            lines = currency.read_lines(crop, langs, float(CFG.get("ocr_scale", 2.0) or 1.0))
+            t_ocr = time.perf_counter() - t0
+            t0 = time.perf_counter()
+            try:
+                rates = currency.load_rates(RATES_PATH, log=log)
+            except currency.RatesUnavailable:
+                self.post(self._show_error, toast, screen_xy, tr("cur_offline"))
+                return
+            t_rates = time.perf_counter() - t0
+            snap = PriceSnapshot(crop, lines, rates, self._save_setting)
+            text, draw = snap.compute()
+            image = None
+            if draw is not None:
+                try:
+                    image = draw(None)
+                except Exception:
+                    traceback.print_exc()
+                    draw = None
+            log(f"цены: «{langs}», строк {len(lines)}, цен {snap.found}; распознавание "
+                f"{t_ocr:.2f} с, курсы {t_rates:.2f} с")
+            self.post(self._show_prices, toast, screen_xy, snap, text, image, draw)
+        except Exception as e:
+            traceback.print_exc()
+            self.post(self._show_error, toast, screen_xy, f'{tr("error")}: {e}')
+
+    def _show_prices(self, toast, screen_xy, snap, text, image, draw):
+        toast.close()
+        if CFG.get("auto_copy", True) and snap.found:
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(text)
+                self.root.update()
+            except Exception:
+                pass
+        # Цен не нашлось — окно всё равно с кнопками валют: выбрать «валюту на
+        # экране» и пересчитать можно прямо тут, не выделяя область заново.
+        ResultWindow(self.root, screen_xy, image=image, translated=text, original="",
+                     rerender=draw, on_theme=self._set_theme, post=self.post, prices=snap)
+
     def _flash(self, message, seconds=2.2):
         """Короткое сообщение, которое само исчезает."""
         toast = Toast(self.root, message)
@@ -4438,6 +4851,7 @@ class App:
         mapping = {
             CFG.get("hotkey_capture", "<ctrl>+<alt>+z"): lambda: self.post(self.start_capture),
             CFG.get("hotkey_clipboard", "<ctrl>+<alt>+x"): lambda: self.post(self.translate_clipboard),
+            CFG.get("hotkey_currency", "<ctrl>+<alt>+d"): lambda: self.post(self.start_currency),
         }
         if sys.platform == "win32":
             self.hotkeys = register_global_hotkeys(mapping, on_fail=self._hotkeys_failed)
@@ -4493,10 +4907,14 @@ class App:
             pystray.MenuItem(
                 lambda _: f'{tr("menu_clip")} ({self._pretty(CFG["hotkey_clipboard"])})',
                 lambda: self.post(self.translate_clipboard)),
+            pystray.MenuItem(
+                lambda _: f'{tr("menu_currency")} ({self._pretty(CFG["hotkey_currency"])})',
+                lambda: self.post(self.start_currency)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda _: tr("target_set"), self._target_menu(pystray)),
             pystray.MenuItem(lambda _: tr("ocr_set"), self._lang_menu(pystray)),
             pystray.MenuItem(lambda _: tr("service_set"), self._translator_menu(pystray)),
+            pystray.MenuItem(lambda _: tr("cur_menu"), self._currency_menu(pystray)),
             pystray.MenuItem(lambda _: tr("menu_theme"), self._theme_menu(pystray)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda _: tr("font_bigger"), lambda: self._bump_font(+0.1)),
@@ -4624,6 +5042,53 @@ class App:
             pystray.MenuItem(lambda _: tr("menu_key"), lambda: self.post(self._ask_api_key)),
         )
 
+    def _currency_menu(self, pystray):
+        """Подменю «Валюты»: в какие считать (галочки) и какая валюта на экране.
+
+        В трее — самые ходовые; полный список открывается кнопками в окне
+        пересчёта. Меню собирается один раз, поэтому валюту, выбранную там и
+        не попавшую в ходовые, здесь не увидеть — зато галочки на ходовых
+        честные: читаются из настроек при каждом открытии меню.
+        """
+        def target(code):
+            return pystray.MenuItem(
+                lambda _, code=code: currency_title(code),
+                lambda: self._toggle_currency(code),
+                checked=lambda _, code=code: code in currency_targets())
+
+        def source(code):
+            return pystray.MenuItem(
+                lambda _, code=code: currency_title(code),
+                lambda: self._set_currency_source(code), radio=True,
+                checked=lambda _, code=code: currency_source() == code)
+
+        return pystray.Menu(
+            pystray.MenuItem(lambda _: tr("cur_show"), None, enabled=False),
+            *[target(code) for code in currency.POPULAR],
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(lambda _: tr("cur_source"), pystray.Menu(
+                *[source(code) for code in ["auto"] + currency.POPULAR])),
+        )
+
+    def _toggle_currency(self, code):
+        chosen = list(currency_targets())
+        if code in chosen:
+            if len(chosen) == 1:            # хоть одна валюта должна остаться
+                return
+            chosen.remove(code)
+        elif len(chosen) >= currency.MAX_TARGETS:
+            self.post(self._flash, tr("cur_max"))
+            return
+        else:
+            chosen.append(code)
+        self._save_setting("currency_targets", chosen)
+        self.post(self._flash, f'{tr("cur_menu")}: '
+                               + " + ".join(currency.symbol(c) for c in chosen))
+
+    def _set_currency_source(self, code):
+        self._save_setting("currency_source", code)
+        self.post(self._flash, f'{tr("cur_source")}: {currency_title(code)}')
+
     def _set_translator(self, code):
         self._save_setting("translator", code)
         titles = {"free": "Google", "deepl": "DeepL", "google_api": "Google Cloud"}
@@ -4699,7 +5164,8 @@ class App:
         tk.Label(win, text=tr("hk_hint"), bg=c["bg"], fg=c["dim"], justify="left",
                  font=("Segoe UI", 9)).pack(padx=18, anchor="w")
 
-        actions = (("hotkey_capture", "menu_capture"), ("hotkey_clipboard", "menu_clip"))
+        actions = (("hotkey_capture", "menu_capture"), ("hotkey_clipboard", "menu_clip"),
+                   ("hotkey_currency", "menu_currency"))
         picked = {name: str(CFG.get(name, DEFAULT_CONFIG[name])) for name, _ in actions}
         ours = set(picked.values())     # эти держим мы сами, на занятость не проверяем
         boxes, recording, held = {}, {"name": None}, set()
@@ -4763,8 +5229,7 @@ class App:
                 status.config(text=tr("hk_need_mod"))
                 return "break"
             combo = "".join(f"<{m}>+" for m in mods) + token
-            other = [n for n, _ in actions if n != name][0]
-            if combo == picked[other]:
+            if any(combo == picked[other] for other, _ in actions if other != name):
                 status.config(text=tr("hk_same"))
                 return "break"
             if combo not in ours and not hotkey_is_free(combo):
@@ -4889,6 +5354,7 @@ class App:
         print(f"  Автозапуск: {'включён' if autostart_enabled() else 'выключен'}")
         print(f"  {self._pretty(CFG['hotkey_capture'])} — выделить область и перевести")
         print(f"  {self._pretty(CFG['hotkey_clipboard'])} — перевести буфер обмена")
+        print(f"  {self._pretty(CFG['hotkey_currency'])} — выделить область и пересчитать цены")
         print("  Выход — через иконку в трее или Ctrl+C в этом окне.")
         load_promo()
         fetch_promo()
@@ -4962,6 +5428,23 @@ def selftest():
             raise RuntimeError("сервис вернул пустой ответ")
         return f"«Hello world» → «{result}»"
 
+    def check_prices():
+        """Разбор цен без распознавания: строки такие, какими их отдаёт Tesseract."""
+        samples = ("Rs. 9,999.00", "149,99 SGD", "$1,299.99", "1 299,99 P")
+        lines = [[{"text": t, "box": (i * 60, 0, i * 60 + 50, 12), "conf": 90}
+                  for i, t in enumerate(line.split())] for line in samples]
+        got = [(p.amount, p.code) for p in currency.find_prices(lines)]
+        want = [(9999.0, "INR"), (149.99, "SGD"), (1299.99, "USD"), (1299.99, "RUB")]
+        if got != want:
+            raise RuntimeError(f"разобралось {got} вместо {want}")
+        return " · ".join(samples) + " — верно"
+
+    def check_rates():
+        rates = currency.load_rates(RATES_PATH, log=log)
+        return (f"ЦБ на {rates.cbr_date or '—'}, запасной на {_dmy(rates.fb_date) or '—'}, "
+                f"валют {len(rates.rub)}" + (" — сохранённые, свежие не скачались"
+                                             if rates.stale else ""))
+
     def check_gui():
         """Окно, картинка в нём и иконка в трее.
 
@@ -4997,6 +5480,8 @@ def selftest():
     step("Языки распознавания", check_langs)
     step("Распознавание текста", check_ocr)
     step("Перевод через интернет", check_translate)
+    step("Разбор цен", check_prices)
+    step("Курсы валют", check_rates)
     step("Окно и иконка в трее", check_gui)
 
     print()
