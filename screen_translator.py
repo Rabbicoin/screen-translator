@@ -3531,7 +3531,10 @@ class ResultWindow:
         self.translated = translated
         self.original = original
         self.image = image                 # чётко отрисованная картинка
-        self.show_text = image is None
+        # Окно цен открывается списком: на картинке пересчитанная сумма лежит
+        # поверх исходной, и не видно, что во что пересчитано. В списке —
+        # «100 kr → 851 ₽» и курс, по которому считали.
+        self.show_text = image is None or prices is not None
         self.text_kind = "trans"           # какой текст показываем: "trans" или "orig"
         self._drag_from = None
         self._text_dragging = False   # тянут окно за пустое место в тексте
@@ -4059,15 +4062,34 @@ class ResultWindow:
         """
         narrow, full = self._bar_widths()
         if self.win_w is None or self.win_h is None:
-            if self.image is not None and not self.show_text:
+            # Окно цен открывается списком, но размер берём и по картинке:
+            # размер у режимов общий, и переключатся на неё — она войдёт.
+            if self.image is not None and (not self.show_text or self.prices is not None):
                 shown = self._display_image()
                 self.win_w, self.win_h = shown.width, shown.height
             else:
                 self.win_w, self.win_h = 540, 300
             self.win_w = max(self.win_w, full - 20)
+            if self.show_text and self.prices is not None:
+                # а список цен с курсами — целиком, без прокрутки
+                self.win_h = max(self.win_h, self._text_height(self.win_w))
         _, _, mon_w, mon_h = monitor_rect_at(self.x, self.y)
         return (max(self.MIN_VIEW_W, narrow - 20, min(int(mon_w * 0.9), int(self.win_w))),
                 max(self.MIN_VIEW_H, min(int(mon_h * 0.85), int(self.win_h))))
+
+    def _text_height(self, width):
+        """Высота, при которой текст шириной `width` виден целиком, без прокрутки.
+
+        Прикидка по шрифту: сам Text считает строки только после раскладки
+        окна, а размер нужен до неё.
+        """
+        font = tkfont.Font(family="Segoe UI", size=self._font_size())
+        room = max(1, width - 8 - SB)           # поля текста и место под полосу
+        body = self.original if self.text_kind == "orig" else self.translated
+        rows = sum(max(1, -(-font.measure(line) // room))
+                   for line in (body or "").split("\n"))
+        line = font.metrics("linespace")
+        return rows * line + line // 2 + 8        # полстроки запаса — прикидка не точна
 
     def _on_text_scroll(self, first, last):
         """Полосу в тексте показываем, только когда есть что листать, — как у картинки.
@@ -4311,10 +4333,6 @@ class ResultWindow:
                     self.translated = text
                     self.rerender = draw
                     if image is not None:
-                        # цены нашлись впервые (раньше было «не нашлось») —
-                        # сразу показываем картинку, ради неё и выбирали валюту
-                        if self.image is None:
-                            self.show_text = False
                         # третья валюта удлиняет подписи, и картинка шире прежней:
                         # окно подстраиваем под неё, а не прячем хвост под прокрутку
                         if self.image is None or self.image.size != image.size:
@@ -4781,13 +4799,46 @@ class PriceSnapshot:
             out.append(("fb", _dmy(self.rates.fb_date)))
         return out
 
+    def rate_lines(self):
+        """«1 SEK = 8,5134 ₽ · $0,1009» — по строке на каждую валюту со снимка.
+
+        Справа — выбранные валюты, как в самом пересчёте. Рубль слева не
+        пишем: «1 ₽ = $0,0119» читать непривычно. Если на снимке рубли,
+        показываем курсы выбранных валют к рублю, как их даёт ЦБ: «1 USD = 84,33 ₽».
+        """
+        comma = ui_lang().split("-")[0] in COMMA_LANGS
+        targets = currency_targets()
+        lines = []
+        for seen in self.seen:
+            if seen == "RUB":
+                pairs = [(t, ["RUB"]) for t in targets if t != "RUB"]
+            else:
+                pairs = [(seen, [t for t in targets if t != seen])]
+            for left, rights in pairs:
+                parts = []
+                for right in rights:
+                    value = self.rates.convert(1, left, right)
+                    if value is not None:
+                        parts.append(currency.fmt_rate(value, right, comma))
+                line = f"1 {left} = " + " · ".join(parts)
+                if parts and line not in lines:
+                    lines.append(line)
+        return lines
+
     def note_long(self):
-        """«Курс ЦБ РФ на 26.09.2026; остальные валюты — по currency-api на 25.09.2026»."""
+        """Откуда курсы и сами курсы:
+
+            Курс ЦБ РФ на 26.09.2026; остальные валюты — по currency-api на 25.09.2026:
+            1 SEK = 8,5134 ₽ · $0,1009
+        """
         parts = self._parts()
         text = "; ".join(
             f'{tr("cur_cbr")} {date}' if kind == "cbr"
             else f'{tr("cur_fb_rest") if i else tr("cur_fb")} {date}'
             for i, (kind, date) in enumerate(parts))
+        rates = self.rate_lines()
+        if rates:
+            text = (text + ":\n" if text else "") + "\n".join(rates)
         if self.rates.stale:
             text = (text + "\n" if text else "") + tr("cur_stale")
         return text

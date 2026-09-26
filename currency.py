@@ -19,6 +19,7 @@
 """
 
 import json
+import math
 import os
 import re
 import threading
@@ -965,6 +966,30 @@ def fmt_amount(value, code, comma=True, short=None):
         text = f"{value:,.{places}f}".replace(",", NBSP)
         if comma:
             text = text.replace(".", ",")
+    return f"{sym}{text}" if prefix else f"{text}{NBSP}{sym}"
+
+
+def fmt_rate(value, code, comma=True):
+    """Курс — цена одной единицы: 8.51342, RUB -> «8,5134 ₽»; 84.331 -> «84,33 ₽».
+
+    Точнее, чем сумма: курс в копейки округлять нельзя — у иены он 0,58 ₽, у
+    воны 0,06 ₽, и два знака съели бы его почти целиком. Поэтому до десятки —
+    четыре знака после запятой, как у ЦБ, а совсем мелкий — четыре значащие
+    цифры. От десятки хватает копеек, от тысячи — целых.
+    """
+    sym, prefix = CURRENCIES.get(code, (code, False))[:2]
+    v = abs(value)
+    if v >= 1000:
+        places = 0
+    elif v >= 10:
+        places = 2
+    elif v >= 0.01 or not v:
+        places = 4
+    else:
+        places = 3 - math.floor(math.log10(v))
+    text = f"{value:,.{places}f}".replace(",", NBSP)
+    if comma:
+        text = text.replace(".", ",")
     return f"{sym}{text}" if prefix else f"{text}{NBSP}{sym}"
 
 
