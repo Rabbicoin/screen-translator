@@ -459,6 +459,14 @@ def find_prices(lines, source="auto"):
             mult = _multiplier_after(norm, after)
             post_at = mult[1] if mult else after
             post = _marker_after(norm, post_at)
+            # «Qty 2 $14.99», «Size 10 $49.99»: знак через пробел, но вплотную к
+            # следующему числу — это его знак, а само число — количество или
+            # размер, не цена. «14,99 $» и слитное «19€99» — по-старому.
+            if post and norm[post_at:post_at + 1] == " " \
+                    and norm[post[1]:post[1] + 1].isdigit() and _marker_before(norm, post[1]):
+                if not pre:
+                    continue
+                post = None
             # буква вплотную к числу без пробела — это слово («iPhone15»), если
             # только сама буква не метка («USD50», «Rs.9»)
             if prev.isalpha() and not pre:
