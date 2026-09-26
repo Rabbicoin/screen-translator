@@ -864,6 +864,7 @@ UI_STRINGS = {
     "mode_list":     ("Списком", "As a list"),
     "cur_old":       ("старая цена", "old price"),
     "cur_picked":    ("валюта по вашему выбору", "currency as you picked"),
+    "cur_seen":      ("Валюта на снимке", "Currency in the picture"),
     "cur_no_rate":   ("нет курса", "no rate"),
     "cur_max":       ("Не больше трёх валют", "Up to three currencies"),
     "cur_cbr":       ("Курс ЦБ РФ на", "Bank of Russia rate as of"),
@@ -3814,9 +3815,11 @@ class ResultWindow:
                 self.cur_to_btn = lang_button(
                     f'{self.prices.targets_title()}  ⌄', tr("cap_cur_to"),
                     self._pick_cur_to, tip=tr("cur_to_tip"))
+                seen = self.prices.seen_title()
                 self.cur_from_btn = lang_button(
                     f'{self.prices.source_title()}  ⌄', tr("cap_cur_from"),
-                    self._pick_cur_from, tip=tr("cur_from_tip"))
+                    self._pick_cur_from,
+                    tip=(f'{tr("cur_seen")}: {seen}\n' if seen else "") + tr("cur_from_tip"))
                 groups += [[self.cur_to_btn], [self.cur_from_btn]]
                 note = self.prices.note_short()
                 if note:
@@ -4693,13 +4696,29 @@ class PriceSnapshot:
         self.save = save            # запись настройки: App._save_setting
         self.found = 0
         self.used = set()           # какие валюты участвовали в пересчёте
+        self.seen = []              # какие валюты нашлись на снимке; частые — первыми
 
     def targets_title(self):
         return " + ".join(currency.symbol(c) for c in currency_targets())
 
     def source_title(self):
+        """Надпись на кнопке «валюта на экране»: «авто: USD» или выбранный код.
+
+        В «авто» показываем, что узнали. Иначе не видно, за какой доллар принят
+        «$» — за американский или сингапурский, — и неясно, пора ли выбирать
+        валюту самому.
+        """
         code = currency_source()
-        return tr("ocr_short") if code == "auto" else code
+        if code != "auto":
+            return code
+        if not self.seen:
+            return tr("ocr_short")
+        shown = ", ".join(self.seen[:2]) + ("…" if len(self.seen) > 2 else "")
+        return f'{tr("ocr_short")}: {shown}'
+
+    def seen_title(self):
+        """«Доллар США (USD), Евро (EUR)» — полностью, для подсказки и списка."""
+        return ", ".join(f"{tr(f'cur_{c}')} ({c})" for c in self.seen)
 
     def set_targets(self, codes):
         self.save("currency_targets", list(codes))
@@ -4733,9 +4752,12 @@ class PriceSnapshot:
             notes = ([tr("cur_old")] if p.strike else []) + ([tr("cur_picked")] if p.weak else [])
             rows.append(f"{p.text} → {label}" + (f"  ({', '.join(notes)})" if notes else ""))
         self.found, self.used = len(prices), used
+        codes = [p.code for p in prices]
+        self.seen = sorted(dict.fromkeys(codes), key=codes.count, reverse=True)
         if not prices:
             return tr("cur_none"), None
-        text = "\n".join(rows) + "\n\n" + self.note_long()
+        text = (f'{tr("cur_seen")}: {self.seen_title()}\n\n' + "\n".join(rows)
+                + "\n\n" + self.note_long())
         min_font = int(_clamp(CFG.get("overlay_min_font", 8), 6, 40, 8))
 
         def draw(zoom, prices=prices, labels=labels):

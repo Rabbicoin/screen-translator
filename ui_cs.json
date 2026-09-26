@@ -198,5 +198,6 @@
  "cur_BTC": "bitcoin",
  "cur_ETH": "ether",
  "cur_USDT": "Tether (USDT)",
- "grip_tip": "Přetažením změňte velikost okna"
+ "grip_tip": "Přetažením změňte velikost okna",
+ "cur_seen": "Měna na snímku"
 }
