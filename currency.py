@@ -199,6 +199,11 @@ _MARKER_SPEC = [
     (["E£"], ("EGP",), "any", False),
     # --- СНГ и рядом
     (["₸", "тг", "тг.", "тенге"], ("KZT",), "any", False),
+    # так английская модель читает «тг», «драм», «сум», «сом» жирным шрифтом
+    (["tr"], ("KZT",), "post", False),
+    (["apam"], ("AMD",), "post", False),
+    (["cym"], ("UZS",), "post", False),
+    (["com"], ("KGS",), "post", False),
     (["₴", "грн", "грн.", "гривен"], ("UAH",), "any", False),
     (["Br", "бел. руб.", "бел.руб."], ("BYN",), "any", False),
     (["₾", "лари"], ("GEL",), "any", False),
@@ -209,8 +214,8 @@ _MARKER_SPEC = [
     (["сомони"], ("TJS",), "any", False),
     (["₺", "TL"], ("TRY",), "any", False),
     # --- Европа
-    (["zł", "zl", "zt"], ("PLN",), "post", False),
-    (["Kč", "Ke"], ("CZK",), "post", False),
+    (["zł", "zl", "zt", "zi"], ("PLN",), "post", False),
+    (["Kč", "Ke", "KC"], ("CZK",), "post", False),
     (["Ft"], ("HUF",), "post", False),
     (["lei"], ("RON",), "post", False),
     (["kr", "kr.", "Kr", "Kr."], KRONAS, "any", False),
@@ -482,6 +487,13 @@ def find_prices(lines, source="auto"):
             try:
                 value = _parse_number(raw, code)
             except ValueError:
+                continue
+            # Дробная часть длиннее, чем бывает у денег, — мусор распознавания:
+            # «12,900원» читается как «12,9000», и с выбранной воной выходило 12,9.
+            # Лучше не показать цену, чем показать неверную.
+            frac = re.search(r"[.,](\d+)$", raw)
+            places = CURRENCIES.get(code, (None, None, 2))[2] if code else 2
+            if frac and len(frac.group(1)) != 3 and len(frac.group(1)) > max(2, places):
                 continue
             if mult:
                 value *= mult[0]
