@@ -176,12 +176,14 @@ _MARKER_SPEC = [
     (["₽", "руб", "руб.", "Руб", "Руб.", "РУБ", "рубль", "рубля", "рублей",
       # так рубли читает английская модель распознавания
       "py6", "py6.", "pyб", "pyб.", "pуб", "pуб."], ("RUB",), "any", False),
-    # «₽» распознавание отдаёт латинской или русской «P», сокращение «р.» —
-    # латинской «p.». После числа это рубль; перед числом та же «P» — песо, ниже.
-    (["р.", "p.", "P", "Р", "р"], ("RUB",), "post", False),
+    # «₽» распознавание отдаёт латинской или русской «P», бывает с «°» спереди
+    # («1299°P»), сокращение «р.» — латинской «p.». После числа это рубль;
+    # перед числом та же «P» — песо, ниже.
+    (["р.", "p.", "°P", "P", "Р", "р"], ("RUB",), "post", False),
     # --- рупии
     (["₹"], ("INR",), "any", False),
-    # «₹» читается как «%». Процент перед числом не пишут, так что ошибки нет.
+    # «₹» читается как «%». Но и настоящий процент перед ценой бывает — скидка
+    # «-15% 1 299 ₽»; как их различаем — в _marker_before и find_prices.
     (["%"], ("INR",), "pre", False),
     (["Rs", "Rs.", "RS", "RS.", "₨", "rupees"], RUPEES, "any", False),
     (["Rp", "Rp."], ("IDR",), "any", False),
@@ -341,7 +343,8 @@ def _parse_number(raw, code_hint=None):
 def _marker_before(text, pos):
     """Метка валюты вплотную перед числом (можно через пробел): (метка, начало) или None."""
     left = text[:pos]
-    if left.endswith(" "):
+    glued = not left.endswith(" ")
+    if not glued:
         left = left[:-1]
     for token in _PRE:
         if left.endswith(token):
@@ -349,6 +352,11 @@ def _marker_before(text, pos):
             prev = left[start - 1] if start > 0 else " "
             # буквенная метка должна стоять отдельно: «iPhoneUSD» — не доллары
             if token[0].isalpha() and prev.isalpha():
+                continue
+            # «%» за числом — процент скидки, а не «₹»: «-15% 1 299 ₽», «-15 % 1299».
+            # Но «₹» прижат к своей цене, и «MRP ₹1,999 ₹999» читается
+            # как «MRP 21,999 %999» — там «%» за числом всё-таки рупия.
+            if token == "%" and re.search(r"\d$" if glued else r"\d ?$", left[:start]):
                 continue
             return token, start
     return None
@@ -472,15 +480,17 @@ def find_prices(lines, source="auto"):
                 resolved = _resolve(codes, is_weak, source, context)
                 if not resolved:
                     continue
-                specific = len(codes) == 1
-                # «$29.99 USD»: общий знак спереди, точный код сзади — верим коду
-                if pick is None or (specific and not pick[2]):
-                    pick = (resolved, side, specific, is_weak, found_marker)
+                # «$29.99 USD»: общий знак спереди, точный код сзади — верим коду.
+                # «%1 299 ₽»: «%» — лишь догадка, что это испорченный «₹»,
+                # а знак сзади настоящий — верим знаку
+                rank = (found_marker[0] != "%", len(codes) == 1)
+                if pick is None or rank > pick[2]:
+                    pick = (resolved, side, rank, is_weak, found_marker)
             if pick:
                 code, side, _, weak, marker = pick
                 if side == "pre":
                     span0 = marker[1]
-                elif not pre:
+                elif not pre or pre[0] == "%":
                     span1 = marker[1]
             if mult and not pick:
                 mult = None             # «10 MB»: без валюты это не множитель
