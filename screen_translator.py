@@ -3569,6 +3569,12 @@ class ResultWindow:
         self.text_widget = None
         self.text_scroll = None
         self._text_sb_shown = False
+        # Нижние полоски: кнопки, строка контактов и уголок. Собирает их
+        # _build_bar, а по строкам раскладывает _reflow.
+        self._bar = self._strip = self._grip = None
+        self._bar_groups, self._bar_tail, self._bar_seps = [], [], set()
+        self._strip_groups = []
+        self._bars_h = 0                     # сколько они сейчас занимают по высоте
 
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
@@ -3592,11 +3598,19 @@ class ResultWindow:
         c = theme()
         self.win.configure(bg=c["bg"])
         self.body.configure(bg=c["bg"])
-        for child in self.body.winfo_children():
-            child.destroy()
+        old = self.body.winfo_children()
 
         self.canvas = self.slider = self.scale_label = None
         self.text_frame = self.text_widget = self.text_scroll = None
+
+        # Кнопки собираем раньше содержимого: от них зависит, насколько узким
+        # может быть окно. Размер рамки с кнопками языка Tk досчитывает только
+        # в update_idletasks — зовём его, пока прежнее содержимое на месте, а
+        # новые кнопки ещё никуда не поставлены: так окно не мигнёт пустым.
+        self._build_bar(c)
+        self.win.update_idletasks()
+        for child in old:
+            child.destroy()
 
         vw, vh = self._viewport()
         if self.image is not None and not self.show_text:
@@ -3679,19 +3693,38 @@ class ResultWindow:
             text.bind("<ButtonRelease-1>", self._text_drop)
         width = vw + 20
 
-        bar = tk.Frame(self.body, bg=c["bar"], height=32)
-        bar.pack(fill="x")
+        self._bar.pack(fill="x")
+        if self._strip is not None:
+            self._strip.pack(fill="x")
+        if self._grip is not None:
+            # Уголок не в строке, а прямо в углу окна: так он на месте, сколько
+            # бы строк ни заняли кнопки, и не переезжает, пока его тянут.
+            self._grip.place(relx=1.0, rely=1.0, x=-2, y=-2, anchor="se")
+            tk.Misc.tkraise(self._grip)      # у холста lift() поднимает рисунки, не его
+        self._reflow(width)
+
+        self.win.update_idletasks()
+        self._place(width)
+
+    def _build_bar(self, c):
+        """Полоска кнопок, строка контактов под ней и уголок размера окна.
+
+        Здесь они только создаются. По строкам их раскладывает _reflow, и не
+        один раз: пока тянут уголок, раскладка меняется под каждую ширину.
+        """
+        bar = tk.Frame(self.body, bg=c["bar"])
         bar.bind("<ButtonPress-1>", self._press)
         bar.bind("<B1-Motion>", self._move)
         bar.bind("<ButtonRelease-1>", self._drop)
+        groups = []        # кучки кнопок слева направо; кучку перенос не разрывает
+        seps = set()       # разделители: в начале строки они лишние
 
         def button(txt, cmd, fg=None, bg=None, hover=None,
-                   padx=10, font=("Segoe UI", 10), tip=None, side="left"):
+                   padx=10, font=("Segoe UI", 10), tip=None):
             fg, bg = fg or c["btn"], bg or c["bar"]
             hover = hover or c["hover"]
             b = tk.Label(bar, text=txt, bg=bg, fg=fg, font=font,
                          padx=padx, pady=6, cursor="hand2")
-            b.pack(side=side)
             b.bind("<Button-1>", lambda e: cmd())
             b.bind("<Enter>", lambda e: b.configure(bg=hover))
             b.bind("<Leave>", lambda e: b.configure(bg=bg))
@@ -3707,7 +3740,6 @@ class ResultWindow:
             Подпись отвечает на этот вопрос, не заставляя наводить мышь.
             """
             box = tk.Frame(bar, bg=c["bar"], cursor="hand2")
-            box.pack(side="left")
             top = tk.Label(box, text=txt, bg=c["bar"], fg=c["btn"],
                            font=("Segoe UI", 10), padx=8)
             top.pack(pady=(3, 0))
@@ -3732,17 +3764,19 @@ class ResultWindow:
         # набор кнопок от режима не зависит, поэтому при переключении панель
         # не меняет ширину и окно не скачет
         showing_orig = self.show_text and self.text_kind == "orig"
-        button("⧉", self.copy, padx=9, font=("Segoe UI", 13),
-               tip=(tr("copy_orig") if showing_orig else
-                    tr("copy_trans") if self.original else tr("copy")))
+        groups.append([button("⧉", self.copy, padx=9, font=("Segoe UI", 13),
+                              tip=(tr("copy_orig") if showing_orig else
+                                   tr("copy_trans") if self.original else tr("copy")))])
         if self.image is not None:
-            mode_button(tr("mode_image"), not self.show_text, self.show_image)
+            groups.append([mode_button(tr("mode_image"), not self.show_text,
+                                       self.show_image)])
         if self.original:
-            mode_button(tr("mode_orig"), showing_orig, lambda: self.show_kind("orig"))
+            groups.append([mode_button(tr("mode_orig"), showing_orig,
+                                       lambda: self.show_kind("orig"))])
         if self.image is not None or self.original:
-            mode_button(tr("mode_list") if self.prices else tr("mode_trans"),
-                        self.show_text and not showing_orig,
-                        lambda: self.show_kind("trans"))
+            groups.append([mode_button(tr("mode_list") if self.prices else tr("mode_trans"),
+                                       self.show_text and not showing_orig,
+                                       lambda: self.show_kind("trans"))])
 
         # Выбор языка перевода прямо здесь: чаще всего он и нужен сразу после
         # того, как перевод увидел глазами. Пересчитываем тот же снимок, второй
@@ -3750,13 +3784,14 @@ class ResultWindow:
         self.target_btn = None
         if self.retranslate is not None:
             if self._working:
-                tk.Label(bar, text=f'{globe_icon(bar)}  {tr("translating")}',
-                         bg=c["bar"], fg=c["dim"],
-                         font=("Segoe UI", 10), padx=10, pady=6).pack(side="left")
+                groups.append([tk.Label(bar, text=f'{globe_icon(bar)}  {tr("translating")}',
+                                        bg=c["bar"], fg=c["dim"],
+                                        font=("Segoe UI", 10), padx=10, pady=6)])
             else:
                 self.target_btn = lang_button(
                     f'{globe_icon(bar)}  {target_title(str(CFG.get("target_lang", "ru")))}  ⌄',
                     tr("cap_target"), self._pick_target, tip=tr("target_tip"))
+                groups.append([self.target_btn])
 
         # Язык на экране — соседней кнопкой. В трее он был и раньше, но туда
         # никто не заглядывает, а выбор ходовой: в английской игре «ENG» вместо
@@ -3766,14 +3801,15 @@ class ResultWindow:
             self.source_btn = lang_button(
                 f'{ocr_short_title(CFG.get("ocr_langs", "auto"))}  ⌄',
                 tr("cap_source"), self._pick_source, tip=tr("ocr_tip"))
+            groups.append([self.source_btn])
 
         # В окне пересчёта цен на том же месте — валюты: в какие считаем и какая
         # на экране. Устроены так же, как языки, чтобы не пришлось привыкать.
         self.cur_to_btn = self.cur_from_btn = None
         if self.prices is not None:
             if self._working:
-                tk.Label(bar, text=tr("cur_working"), bg=c["bar"], fg=c["dim"],
-                         font=("Segoe UI", 10), padx=10, pady=6).pack(side="left")
+                groups.append([tk.Label(bar, text=tr("cur_working"), bg=c["bar"],
+                                        fg=c["dim"], font=("Segoe UI", 10), padx=10, pady=6)])
             else:
                 self.cur_to_btn = lang_button(
                     f'{self.prices.targets_title()}  ⌄', tr("cap_cur_to"),
@@ -3781,20 +3817,21 @@ class ResultWindow:
                 self.cur_from_btn = lang_button(
                     f'{self.prices.source_title()}  ⌄', tr("cap_cur_from"),
                     self._pick_cur_from, tip=tr("cur_from_tip"))
+                groups += [[self.cur_to_btn], [self.cur_from_btn]]
                 note = self.prices.note_short()
                 if note:
                     label = tk.Label(bar, text=note, bg=c["bar"], fg=c["faint"],
                                      font=("Segoe UI", 8), padx=6, pady=6)
-                    label.pack(side="left")
                     Tooltip(label, self.prices.note_long())
+                    groups.append([label])
 
         # ползунок крупности: в тексте — кегль шрифта, в картинке — масштаб оверлея.
         # Размера окна не касается, за него отвечает уголок.
         if self.show_text or self.rerender is not None:
-            tk.Label(bar, text="│", bg=c["bar"], fg=c["line"],
-                     font=("Segoe UI", 10), pady=6).pack(side="left")
-            tk.Label(bar, text="A", bg=c["bar"], fg=c["dim"],
-                     font=("Segoe UI", 8), padx=(2), pady=6).pack(side="left")
+            sep = tk.Label(bar, text="│", bg=c["bar"], fg=c["line"],
+                           font=("Segoe UI", 10), pady=6)
+            small = tk.Label(bar, text="A", bg=c["bar"], fg=c["dim"],
+                             font=("Segoe UI", 8), padx=(2), pady=6)
             self.slider = tk.Scale(bar, from_=int(self.MIN_SCALE * 100),
                                    to=int(self.MAX_SCALE * 100), orient="horizontal",
                                    length=104, width=8, sliderlength=14, showvalue=0,
@@ -3807,66 +3844,162 @@ class ResultWindow:
             self._slider_sync = True                # set() дёргает command — глушим
             self.slider.set(int(round(self.scale * 100)))
             self._slider_sync = False
-            self.slider.pack(side="left", padx=(0, 2))
             self.slider.bind("<ButtonRelease-1>", lambda e: self.set_zoom(self.scale))
-            tk.Label(bar, text="A", bg=c["bar"], fg=c["dim"],
-                     font=("Segoe UI", 13), padx=2, pady=3).pack(side="left")
+            big = tk.Label(bar, text="A", bg=c["bar"], fg=c["dim"],
+                           font=("Segoe UI", 13), padx=2, pady=3)
             self.scale_label = tk.Label(bar, text=f"{int(round(self.scale * 100))}%",
                                         bg=c["bar"], fg=c["faint"], width=5,
                                         font=("Segoe UI", 9), padx=4, pady=6)
-            self.scale_label.pack(side="left")
+            seps.add(sep)
+            groups.append([sep, small, self.slider, big, self.scale_label])
         close = tk.Label(bar, text="✕", bg=c["bar"], fg=c["btn"], font=("Segoe UI", 11),
                          padx=12, pady=5, cursor="hand2")
-        close.pack(side="right")
         close.bind("<Button-1>", lambda e: self.close())
         close.bind("<Enter>", lambda e: close.configure(bg=c["close"], fg="#ffffff"))
         close.bind("<Leave>", lambda e: close.configure(bg=c["bar"], fg=c["btn"]))
+        tail = [close]
 
         # Переключатель оформления: показываем не то, что сейчас, а то, что
         # получится по нажатию, — солнце в тёмном окне и месяц в светлом. Так
         # понятнее, чем значок текущего состояния: видно, куда ведёт кнопка.
         if self.on_theme is not None:
             dark_now = theme_name() == "dark"
-            button("☀" if dark_now else "☾",
-                   lambda: self.on_theme("light" if dark_now else "dark"),
-                   padx=9, font=("Segoe UI", 12), side="right",
-                   tip=tr("theme_light") if dark_now else tr("theme_dark"))
+            tail.insert(0, button("☀" if dark_now else "☾",
+                                  lambda: self.on_theme("light" if dark_now else "dark"),
+                                  padx=9, font=("Segoe UI", 12),
+                                  tip=tr("theme_light") if dark_now else tr("theme_dark")))
 
         promo = promo_line()
-        strip = None
-        if promo:
+        parts = promo_parts(promo[0], promo[1]) if promo else []
+        strip, words = None, []
+        if parts:
             # Строка собирается из кусков: у каждой ссылки свой адрес. Одной
             # надписью тут не обойтись: Tkinter не умеет вешать разные действия
-            # на части одного Label.
-            parts = promo_parts(promo[0], promo[1])
+            # на части одного Label. Куски режем ещё и на слова — в узком окне
+            # строка переносится, как обычный текст.
             strip = tk.Frame(self.body, bg=c["bar"])
-            strip.pack(fill="x")
-            for i, (chunk, link) in enumerate(parts):
-                lbl = tk.Label(strip, text=chunk, bg=c["bar"],
-                               fg=c["btn"] if link else c["dim"],
-                               font=("Segoe UI", 9), pady=4,
-                               cursor="hand2" if link else "arrow")
-                lbl.pack(side="left", padx=(12, 0) if i == 0 else 0)
-                if link:
-                    lbl.bind("<Button-1>", lambda e, u=link: webbrowser.open(u))
-                    lbl.bind("<Enter>",
-                             lambda e, w=lbl: w.configure(font=("Segoe UI", 9, "underline")))
-                    lbl.bind("<Leave>", lambda e, w=lbl: w.configure(font=("Segoe UI", 9)))
+            for chunk, link in parts:
+                # Без своих полей у надписей: промежуток между словами — это
+                # пробел в тексте, иначе он выходит втрое шире обычного. Поля
+                # сверху и снизу — у всей строки, а не у каждой её строчки.
+                labels = [tk.Label(strip, text=word, bg=c["bar"],
+                                   fg=c["btn"] if link else c["dim"],
+                                   font=("Segoe UI", 9), bd=0, padx=0, pady=2,
+                                   cursor="hand2" if link else "arrow")
+                          for word in re.findall(r"\s*\S+\s*", chunk) or [chunk]]
+                for lbl in labels:
+                    # «·» и прочие знаки без букв строку не начинают — едут
+                    # вместе со словом перед ними
+                    if words and not any(ch.isalnum() for ch in lbl.cget("text")):
+                        words[-1].append(lbl)
+                    else:
+                        words.append([lbl])
+                    if link:
+                        # подчёркиваем ссылку целиком, а не одно слово под мышью
+                        lbl.bind("<Button-1>", lambda e, u=link: webbrowser.open(u))
+                        lbl.bind("<Enter>", lambda e, ws=labels: [
+                            w.configure(font=("Segoe UI", 9, "underline")) for w in ws])
+                        lbl.bind("<Leave>", lambda e, ws=labels: [
+                            w.configure(font=("Segoe UI", 9)) for w in ws])
 
+        self._bar, self._bar_groups, self._bar_tail, self._bar_seps = bar, groups, tail, seps
+        self._strip, self._strip_groups = strip, words
         # Уголок для размера окна — в самом правом нижнем углу, как у обычных
-        # окон Windows: там его и ищут. Раньше он стоял в полоске кнопок левее
-        # луны, и его не находили — принимали за ещё одну кнопку. Самый нижний
-        # ряд — строка с контактами, а если её нет, то полоска кнопок: там
-        # уголок встаёт правее ✕.
+        # окон Windows: там его и ищут. В полоске кнопок его не находили —
+        # принимали за ещё одну кнопку.
+        self._grip = None
         if self.show_text or self.rerender is not None:
-            grip = self._size_grip(strip if strip is not None else bar, c)
-            if strip is not None:
-                grip.pack(side="right", anchor="se", padx=(8, 2), pady=(0, 2))
-            else:
-                grip.pack(side="right", anchor="se", before=close, padx=(0, 2), pady=(0, 2))
+            self._grip = self._size_grip(self.body, c)
 
-        self.win.update_idletasks()
-        self._place(width)
+    STRIP_PAD = 12        # поле слева и справа у строки контактов
+
+    def _reflow(self, width):
+        """Раскладывает кнопки и строку контактов под ширину окна.
+
+        В узком окне кнопки не уходят за край, а переносятся на следующую
+        строку, как слова в тексте. Возвращает, сколько обе полоски заняли по
+        высоте.
+        """
+        room = self._grip_room()
+        height = self._flow(self._bar, self._bar_groups, width, tail=self._bar_tail,
+                            reserve=0 if self._strip is not None else room,
+                            seps=self._bar_seps)
+        if self._strip is not None:
+            height += self._flow(self._strip, self._strip_groups, width,
+                                 reserve=room, margin=self.STRIP_PAD, pady=4)
+        self._bars_h = height
+        return height
+
+    @staticmethod
+    def _flow(frame, groups, width, tail=(), reserve=0, margin=0, pady=0, seps=()):
+        """Ставит виджеты рамки по строкам: в каждую — сколько войдёт.
+
+        groups  — кучки слева направо; кучка целиком встаёт в одну строку;
+        tail    — прижаты к правому краю последней строки (луна и ✕);
+        reserve — место справа в последней строке, под уголок размера;
+        margin  — поле слева и справа, pady — сверху и снизу;
+        seps    — разделители: в начале строки они лишние и прячутся.
+        Возвращает высоту рамки.
+        """
+        room = width - 2 * margin
+        tail_w = sum(w.winfo_reqwidth() for w in tail)
+        rows, used = [[]], 0
+        for i, group in enumerate(groups):
+            gw = sum(w.winfo_reqwidth() for w in group)
+            # без луны и ✕ место под уголок нужно самой последней кучке
+            need = gw + (reserve if i == len(groups) - 1 and not tail else 0)
+            if rows[-1] and used + need > room:
+                rows.append([])
+                used = 0
+            if not rows[-1] and group[0] in seps:
+                group[0].place_forget()
+                gw -= group[0].winfo_reqwidth()
+                group = group[1:]
+            rows[-1].extend(group)
+            used += gw
+        if tail and rows[-1] and used + tail_w + reserve > room:
+            rows.append([])
+
+        y = pady
+        for i, row in enumerate(rows):
+            spans = [(margin, row)]
+            if i == len(rows) - 1:
+                spans.append((width - margin - reserve - tail_w, tail))
+            h = max((w.winfo_reqheight() for _, ws in spans for w in ws), default=0)
+            for x, ws in spans:
+                for w in ws:
+                    w.place(x=x, y=y + (h - w.winfo_reqheight()) // 2)
+                    x += w.winfo_reqwidth()
+            y += h
+        y += pady
+        frame.configure(height=max(1, y))
+        return y
+
+    def _grip_room(self):
+        """Сколько места оставить справа в нижней строке под уголок."""
+        return int(self._grip.cget("width")) + 8 if self._grip is not None else 0
+
+    def _bar_widths(self):
+        """(самое узкое окно, окно, где всё встаёт в одну строку).
+
+        Уже самой широкой кучки кнопок или слов окно не бывает: кучка
+        не разрывается, и в узком окне ей не во что было бы встать.
+        """
+        def wide(ws):
+            return sum(w.winfo_reqwidth() for w in ws)
+
+        room = self._grip_room()
+        tail = wide(self._bar_tail) + (0 if self._strip is not None else room)
+        narrow = max([tail] + [wide(g[1:] if g[0] in self._bar_seps else g)
+                               for g in self._bar_groups])
+        full = sum(wide(g) for g in self._bar_groups) + tail
+        words = self._strip_groups
+        if words:
+            pad = 2 * self.STRIP_PAD
+            narrow = max(narrow, max(wide(g) for g in words) + pad,
+                         wide(words[-1]) + room + pad)
+            full = max(full, sum(wide(g) for g in words) + room + pad)
+        return narrow, full
 
     def _size_grip(self, parent, c):
         """Уголок размера окна: лесенка из шести точек, как у окон Windows.
@@ -3914,15 +4047,23 @@ class ResultWindow:
             bring_to_foreground(self.win)
 
     def _viewport(self):
-        """Размер области содержимого: задан уголком, при первой сборке — по содержимому."""
+        """Размер области содержимого: задан уголком, при первой сборке — по содержимому.
+
+        Содержимое всегда во всю ширину окна: окно не бывает шире него, а
+        ограничивают его кнопки внизу. Уже самой тесной их раскладки окно
+        не сжать, а при первой сборке оно не уже, чем нужно всем кнопкам в
+        одну строку, — в несколько строк они встают, только если окно сузили.
+        """
+        narrow, full = self._bar_widths()
         if self.win_w is None or self.win_h is None:
             if self.image is not None and not self.show_text:
                 shown = self._display_image()
                 self.win_w, self.win_h = shown.width, shown.height
             else:
                 self.win_w, self.win_h = 540, 300
+            self.win_w = max(self.win_w, full - 20)
         _, _, mon_w, mon_h = monitor_rect_at(self.x, self.y)
-        return (max(self.MIN_VIEW_W, min(int(mon_w * 0.9), int(self.win_w))),
+        return (max(self.MIN_VIEW_W, narrow - 20, min(int(mon_w * 0.9), int(self.win_w))),
                 max(self.MIN_VIEW_H, min(int(mon_h * 0.85), int(self.win_h))))
 
     def _on_text_scroll(self, first, last):
@@ -4289,20 +4430,27 @@ class ResultWindow:
 
     def _grip_press(self, event):
         vw, vh = self._viewport()
-        self._resize_from = (event.x_root, event.y_root, vw, vh)
+        self._resize_from = (event.x_root, event.y_root, vw, vh, self._bars_h)
 
     def _grip_drag(self, event):
-        """Уголок меняет только размер окна. Крупность содержимого не трогаем."""
+        """Уголок меняет только размер окна. Крупность содержимого не трогаем.
+
+        Низ окна идёт за мышью. Когда кнопки переезжают на новую строку,
+        полоска внизу растёт — на столько же ужимаем содержимое, иначе угол
+        окна уезжал бы из-под мыши.
+        """
         if not self._resize_from:
             return
-        x0, y0, w0, h0 = self._resize_from
-        self.win_w = max(self.MIN_VIEW_W, w0 + event.x_root - x0)
-        self.win_h = max(self.MIN_VIEW_H, h0 + event.y_root - y0)
-        vw, vh = self._viewport()
         holder = self.text_frame if self.show_text else (
             self.canvas.master if self.canvas is not None else None)
         if holder is None:
             return
+        x0, y0, w0, h0, bars0 = self._resize_from
+        self.win_w = max(self.MIN_VIEW_W, w0 + event.x_root - x0)
+        vw, _ = self._viewport()
+        bars = self._reflow(vw + 20)
+        self.win_h = max(self.MIN_VIEW_H, h0 + event.y_root - y0 - (bars - bars0))
+        vw, vh = self._viewport()
         holder.configure(width=vw, height=vh)
         if not self.show_text and self.canvas is not None:
             # полосы прокрутки пересчитаются на отпускании, пока просто тянем холст
