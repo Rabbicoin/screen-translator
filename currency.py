@@ -446,10 +446,11 @@ def find_prices(lines, source="auto"):
         text, spans = _line_text(line)
         norm = text.translate(_NORM)
         items = []
+        taken = 0                   # до сюда строка уже разобрана: копейки «19€99»
         for m in _NUM.finditer(norm):
             start, end = m.start(), m.end()
             prev = norm[start - 1] if start else " "
-            if prev.isdigit():
+            if prev.isdigit() or start < taken:
                 continue
             # хвост «.–» у швейцарских цен — часть числа, а не минус
             tail = _SWISS_TAIL.match(norm[end:])
@@ -461,12 +462,23 @@ def find_prices(lines, source="auto"):
             post = _marker_after(norm, post_at)
             # «Qty 2 $14.99», «Size 10 $49.99»: знак через пробел, но вплотную к
             # следующему числу — это его знак, а само число — количество или
-            # размер, не цена. «14,99 $» и слитное «19€99» — по-старому.
+            # размер, не цена. «14,99 $» — по-старому, слитное «19€99» — ниже.
             if post and norm[post_at:post_at + 1] == " " \
                     and norm[post[1]:post[1] + 1].isdigit() and _marker_before(norm, post[1]):
                 if not pre:
                     continue
                 post = None
+            # «19€99» — так пишут во Франции и Бельгии: знак стоит на месте
+            # запятой, и две цифры за ним — копейки этой же цены, а не вторая
+            # цена «€99». Только знак, вплотную с обеих сторон, и ровно две цифры.
+            if post and not pre and post_at == end and post[1] == end + len(post[0]) \
+                    and not any(ch.isalnum() for ch in post[0]) \
+                    and not re.search(r"[.,]\d{1,2}$", raw):
+                cents = _NUM.match(norm, post[1])
+                if cents and len(cents.group()) == 2:
+                    raw = f"{raw}.{cents.group()}"
+                    post = (post[0], cents.end())    # копейки — в рамку цены
+                    taken = cents.end()
             # буква вплотную к числу без пробела — это слово («iPhone15»), если
             # только сама буква не метка («USD50», «Rs.9»)
             if prev.isalpha() and not pre:
