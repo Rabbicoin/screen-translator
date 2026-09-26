@@ -3686,6 +3686,15 @@ class ResultWindow:
 
             body = self.original if self.text_kind == "orig" else self.translated
             text.insert("end", body or tr("no_text"))
+            # В окне цен строки пересчёта — жирным: ради них окно и открывали,
+            # а строка о валюте и курсы — пояснения к ним. Пометки вроде
+            # «(старая цена)» остаются обычными.
+            text.tag_configure("strong", font=("Segoe UI", fs, "bold"))
+            if self.prices is not None and self.text_kind == "trans":
+                for n, line in enumerate((body or "").split("\n"), 1):
+                    part = next((s for s in self.prices.strong if line.startswith(s)), None)
+                    if part:
+                        text.tag_add("strong", f"{n}.0", f"{n}.{len(part)}")
             self._make_readonly(text)
             self.text_widget = text
             # колесо здесь листает текст, поэтому кегль — на Ctrl+колесо
@@ -4392,6 +4401,7 @@ class ResultWindow:
                 return
             fs = self._font_size()
             self.text_widget.configure(font=("Segoe UI", fs))
+            self.text_widget.tag_configure("strong", font=("Segoe UI", fs, "bold"))
             return
 
         shown = self._display_image()
@@ -4715,6 +4725,7 @@ class PriceSnapshot:
         self.found = 0
         self.used = set()           # какие валюты участвовали в пересчёте
         self.seen = []              # какие валюты нашлись на снимке; частые — первыми
+        self.strong = []            # «100 € → 9 587 ₽ · $114»: в списке — жирным
 
     def targets_title(self):
         return " + ".join(currency.symbol(c) for c in currency_targets())
@@ -4750,7 +4761,7 @@ class PriceSnapshot:
         prices = currency.find_prices(self.lines, currency_source())
         comma = ui_lang().split("-")[0] in COMMA_LANGS
         short = (tr("cur_thousand"), tr("cur_million"), tr("cur_billion"))
-        labels, rows, used = [], [], set()
+        labels, rows, strong, used = [], [], [], set()
         for p in prices:
             parts = []
             for t in targets:
@@ -4768,8 +4779,9 @@ class PriceSnapshot:
             label = " · ".join(parts)
             labels.append(label)
             notes = ([tr("cur_old")] if p.strike else []) + ([tr("cur_picked")] if p.weak else [])
-            rows.append(f"{p.text} → {label}" + (f"  ({', '.join(notes)})" if notes else ""))
-        self.found, self.used = len(prices), used
+            strong.append(f"{p.text} → {label}")
+            rows.append(strong[-1] + (f"  ({', '.join(notes)})" if notes else ""))
+        self.found, self.used, self.strong = len(prices), used, strong
         codes = [p.code for p in prices]
         self.seen = sorted(dict.fromkeys(codes), key=codes.count, reverse=True)
         if not prices:
