@@ -835,6 +835,7 @@ UI_STRINGS = {
                       "tray → Keyboard shortcuts"),
     "save":          ("Сохранить", "Save"),
     "cancel":        ("Отмена", "Cancel"),
+    "grip_tip":      ("Потяните, чтобы изменить размер окна", "Drag to resize the window"),
     # --- пересчёт цен
     "menu_currency": ("Пересчитать цены", "Convert prices"),
     "cur_menu":      ("Валюты", "Currencies"),
@@ -3831,20 +3832,12 @@ class ResultWindow:
                    padx=9, font=("Segoe UI", 12), side="right",
                    tip=tr("theme_light") if dark_now else tr("theme_dark"))
 
-        # уголок в правом нижнем углу — тянуть мышью, как за край обычного окна
-        if self.show_text or self.rerender is not None:
-            grip = tk.Label(bar, text="◢", bg=c["bar"], fg=c["grip"],
-                            font=("Segoe UI", 10), padx=8, pady=5, cursor="sizing")
-            grip.pack(side="right")
-            grip.bind("<ButtonPress-1>", self._grip_press)
-            grip.bind("<B1-Motion>", self._grip_drag)
-            grip.bind("<ButtonRelease-1>", self._grip_release)
-
         promo = promo_line()
+        strip = None
         if promo:
-            # Ð¡ÑÑÐ¾ÐºÐ° ÑÐ¾Ð±Ð¸ÑÐ°ÐµÑÑÑ Ð¸Ð· ÐºÑÑÐºÐ¾Ð²: Ñ ÐºÐ°Ð¶Ð´Ð¾Ð¹ ÑÑÑÐ»ÐºÐ¸ ÑÐ²Ð¾Ð¹ Ð°Ð´ÑÐµÑ. ÐÐ´Ð½Ð¾Ð¹
-            # Ð½Ð°Ð´Ð¿Ð¸ÑÑÑ ÑÑÑ Ð½Ðµ Ð¾Ð±Ð¾Ð¹ÑÐ¸ÑÑ: Tkinter Ð½Ðµ ÑÐ¼ÐµÐµÑ Ð²ÐµÑÐ°ÑÑ ÑÐ°Ð·Ð½ÑÐµ Ð´ÐµÐ¹ÑÑÐ²Ð¸Ñ
-            # Ð½Ð° ÑÐ°ÑÑÐ¸ Ð¾Ð´Ð½Ð¾Ð³Ð¾ Label.
+            # Строка собирается из кусков: у каждой ссылки свой адрес. Одной
+            # надписью тут не обойтись: Tkinter не умеет вешать разные действия
+            # на части одного Label.
             parts = promo_parts(promo[0], promo[1])
             strip = tk.Frame(self.body, bg=c["bar"])
             strip.pack(fill="x")
@@ -3860,8 +3853,53 @@ class ResultWindow:
                              lambda e, w=lbl: w.configure(font=("Segoe UI", 9, "underline")))
                     lbl.bind("<Leave>", lambda e, w=lbl: w.configure(font=("Segoe UI", 9)))
 
+        # Уголок для размера окна — в самом правом нижнем углу, как у обычных
+        # окон Windows: там его и ищут. Раньше он стоял в полоске кнопок левее
+        # луны, и его не находили — принимали за ещё одну кнопку. Самый нижний
+        # ряд — строка с контактами, а если её нет, то полоска кнопок: там
+        # уголок встаёт правее ✕.
+        if self.show_text or self.rerender is not None:
+            grip = self._size_grip(strip if strip is not None else bar, c)
+            if strip is not None:
+                grip.pack(side="right", anchor="se", padx=(8, 2), pady=(0, 2))
+            else:
+                grip.pack(side="right", anchor="se", before=close, padx=(0, 2), pady=(0, 2))
+
         self.win.update_idletasks()
         self._place(width)
+
+    def _size_grip(self, parent, c):
+        """Уголок размера окна: лесенка из шести точек, как у окон Windows.
+
+        Нарисован, а не набран символом: «◢» в шрифте выходил то мелким, то
+        сдвинутым, и уголком не читался. Над ним курсор — двойная диагональная
+        стрелка, а точки подсвечиваются: так видно, что его можно тянуть.
+        """
+        # точка в 3 px на обычном экране и крупнее на экране с увеличением:
+        # в 2 px, как у Windows, уголок терялся на полоске
+        unit = max(3, int(round(float(self.win.tk.call("tk", "scaling")) * 2.25)))
+        size = unit * 7
+        grip = tk.Canvas(parent, width=size, height=size, bg=c["bar"], bd=0,
+                         highlightthickness=0, cursor="size_nw_se")
+        dots = []
+        for row in range(3):
+            for col in range(3):
+                if row + col >= 2:                  # только треугольник к углу
+                    x, y = (col * 2 + 1) * unit, (row * 2 + 1) * unit
+                    dots.append(grip.create_rectangle(x, y, x + unit, y + unit,
+                                                      fill=c["grip"], outline=""))
+
+        def paint(color):
+            for dot in dots:
+                grip.itemconfigure(dot, fill=color)
+
+        grip.bind("<Enter>", lambda e: paint(c["accent"]), add="+")
+        grip.bind("<Leave>", lambda e: paint(c["grip"]), add="+")
+        grip.bind("<ButtonPress-1>", self._grip_press, add="+")
+        grip.bind("<B1-Motion>", self._grip_drag, add="+")
+        grip.bind("<ButtonRelease-1>", self._grip_release, add="+")
+        Tooltip(grip, tr("grip_tip"))
+        return grip
 
     def _place(self, width, focus=True):
         # держимся того монитора, на котором окно сейчас стоит, а не главного

@@ -197,5 +197,6 @@
  "cur_ISK": "islandská koruna",
  "cur_BTC": "bitcoin",
  "cur_ETH": "ether",
- "cur_USDT": "Tether (USDT)"
+ "cur_USDT": "Tether (USDT)",
+ "grip_tip": "Přetažením změňte velikost okna"
 }
