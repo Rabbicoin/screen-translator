@@ -758,9 +758,14 @@ def read_lines(img, langs="eng", scale=2.0):
                     head = re.match(r"^(\D*)(\d+)", word)
                     if head:
                         digits = head.group(2)
-                        if digits.endswith(cents) and len(digits) > len(cents):
+                        # «19€⁹⁹» — Франция: знак стоит на месте запятой, между целыми
+                        # и копейками. Знак не теряем, а копеек в цифрах перед ним
+                        # нет: «299€⁹⁹» — это 299,99, а не «2.99»
+                        sign = _marker_after(word[head.end():].translate(_NORM), 0)
+                        sign = sign[0] if sign and not sign[0][0].isalnum() else ""
+                        if not sign and digits.endswith(cents) and len(digits) > len(cents):
                             digits = digits[:-len(cents)]
-                        word = f"{head.group(1)}{digits}.{cents.ljust(2, '0')}"
+                        word = f"{head.group(1)}{digits}.{cents.ljust(2, '0')}{sign}"
         key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
         rows.setdefault(key, []).append({
             "text": word, "conf": conf, "strike": strike,
