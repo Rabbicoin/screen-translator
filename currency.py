@@ -572,6 +572,11 @@ def _span_box(line, spans, a, b):
         full = _measure(text) or 1
         cx0 = wx0 + (wx1 - wx0) * _measure(text[:lo - s]) / full
         cx1 = wx0 + (wx1 - wx0) * _measure(text[:hi - s]) / full
+        # «руб.» распознаётся как «py6.20»: цифры, прилипшие к знаку после
+        # числа, — не хвост слова, а те же буквы, прочитанные лишний раз. По
+        # ширине букв рамка кончалась на «6», и «б.» торчало из-под заливки
+        if text[hi - s:].isdigit() and not text[hi - s - 1].isdigit():
+            cx1 = wx1
         x0, x1 = min(x0, cx0), max(x1, cx1)
         for k in range(lo, hi):
             if text[k - s].isdigit():
@@ -1149,9 +1154,15 @@ def render(img, prices, labels, lines, zoom=1.0, min_font=8):
                 draw = ImageDraw.Draw(out)
 
             # заливка — по всей старой рамке со знаком валюты, а не только по
-            # цифрам, и с запасом справа: точка от «руб.» выходит за рамку слова
-            cover = (x0 - 1, min(oy0, y0) - 2, max(x1 + max(2, size // 6), x0 + need) + 1,
-                     oy1 + 2)
+            # цифрам, и с запасом справа: точка от «руб.» выходит за рамку слова.
+            # По высоте — по всем словам цены: рамка цены взята по цифрам, а
+            # «руб.» и «грн» опускаются ниже них, и хвосты «р» и «у» торчали
+            under = [w["box"] for w in same_row
+                     if min(w["box"][2], ox1) - max(w["box"][0], ox0)
+                     > 0.5 * min(w["box"][2] - w["box"][0], ox1 - ox0)]
+            cover = (x0 - 1, min([oy0, y0] + [b[1] for b in under]) - 2,
+                     max(x1 + max(2, size // 6), x0 + need) + 1,
+                     max([oy1] + [b[3] for b in under]) + 2)
             cx0, cy0 = max(0, cover[0]), max(0, cover[1])
             cx1, cy1 = min(out.width, cover[2]), min(out.height, cover[3])
             if cx1 > cx0 and cy1 > cy0:
