@@ -24,9 +24,11 @@ from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
 FONTS = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
 
-# (текст, стиль, валюта на экране, ожидаемое [(сумма, код, зачёркнута)])
+# (текст, стиль, валюта на экране, ожидаемое [(сумма, код, зачёркнута[, рамка])])
 # стиль: "" — обычный, "big" — крупная жирная цена, "sup" — копейки мелко сверху
 # после «|», "strike" — первая цена зачёркнута. Пустой список — «не трогать».
+# Рамка — что закроет пересчёт, как это прочло распознавание («₽» оно читает
+# как «P»); где её нет, рамку не сверяем.
 CASES = [
     # разделители
     ("149,99 SGD (includes GST)", "", "auto", [(149.99, "SGD", False)]),
@@ -90,6 +92,17 @@ CASES = [
     ("$10–$20", "", "auto", [(10, "USD", False), (20, "USD", False)]),
     ("от 1 500 до 3 000 ₽", "", "auto", [(1500, "RUB", False), (3000, "RUB", False)]),
     ("Was £40 Now £25", "", "auto", [(40, "GBP", False), (25, "GBP", False)]),
+    # знак между двумя числами — одного из них: к какому прижат, а если ни к
+    # какому — с той стороны, где эту валюту пишут
+    ("2499 $14.99", "strike", "auto", [(14.99, "USD", False)]),
+    ("40$ 25$", "strike", "auto", [(40, "USD", True), (25, "USD", False)]),
+    ("999 ₽ 1 299 ₽", "", "auto", [(999, "RUB", False, "999 P"), (1299, "RUB", False, "1 299 P")]),
+    ("1299₽ 999₽", "", "auto", [(1299, "RUB", False, "1299P"), (999, "RUB", False, "999P")]),
+    ("1 299 руб. 999 руб.", "", "auto",
+     [(1299, "RUB", False, "1 299 руб."), (999, "RUB", False, "999 руб.")]),
+    # старая цена читается как «i299 py6.» — её рубль не достаётся новой
+    ("1299 руб. 999 руб.", "strike", "auto", [(999, "RUB", False, "999 руб.")]),
+    ("$29.99 USD", "", "auto", [(29.99, "USD", False, "$29.99 USD")]),
     # цифры, которые не деньги
     ("$4.99/mo", "", "auto", [(4.99, "USD", False)]),
     ("Save 20% — now 79,99 €", "", "auto", [(79.99, "EUR", False)]),
@@ -155,9 +168,10 @@ def main():
         img = draw_case(text, style)
         langs = "eng+chi_sim" if any(ord(c) > 0x2E80 for c in text) else "eng+rus"
         lines = currency.read_lines(img, langs)
-        got = [(round(p.amount, 6), p.code, p.strike)
+        box = any(len(w) > 3 for w in want)
+        got = [(round(p.amount, 6), p.code, p.strike) + ((p.text,) if box else ())
                for p in currency.find_prices(lines, source)]
-        ok = got == [(round(a, 6), c, s) for a, c, s in want]
+        ok = got == [(round(w[0], 6),) + tuple(w[1:]) for w in want]
         bad += not ok
         read = " | ".join(" ".join(w["text"] for w in ln) for ln in lines)
         mark = "ok" if ok else "!!"

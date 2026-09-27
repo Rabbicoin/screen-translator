@@ -424,6 +424,29 @@ def _looks_like_price(text, start, end, value):
     return False
 
 
+def _sign_goes_right(left, right):
+    """Знак стоит между двумя числами — чей он: True — правого, False — левого.
+
+    `left` и `right` — метки обоих чисел; спорный знак у левого — «post»,
+    у правого — «pre». По порядку:
+      - прижат к одному числу, от другого отделён пробелом — того, к кому
+        прижат: «2499 $14.99» (зачёркнутую «$24.99» распознавание прочло без
+        знака и точки) — доллар у 14.99, а 2499 остаётся без знака;
+      - у одного числа свой знак уже есть с дальней стороны — спорный знак
+        другому: «40 $ 25 $», «$ 40 $ 25»;
+      - иначе — по тому, с какой стороны эту валюту пишут: «₽» за числом, «$»
+        перед ним. Так в «1 299 ₽ 999» рубль у 1 299, а 999 — число без знака.
+    """
+    sign, same = left["post"], right["pre"]
+    if sign["glued"] != same["glued"]:
+        return same["glued"]
+    if "pre" in left and "post" not in right:
+        return True
+    if "post" in right and "pre" not in left:
+        return False
+    return CURRENCIES[sign["code"]][1]
+
+
 class Price:
     """Найденная цена: сколько, в чём, где на картинке и зачёркнута ли."""
 
@@ -453,7 +476,7 @@ def find_prices(lines, source="auto"):
     for line in lines:
         text, spans = _line_text(line)
         norm = text.translate(_NORM)
-        items = []
+        nums = []
         for m in _NUM.finditer(norm):
             start, end = m.start(), m.end()
             prev = norm[start - 1] if start else " "
@@ -461,40 +484,79 @@ def find_prices(lines, source="auto"):
                 continue
             # хвост «.–» у швейцарских цен — часть числа, а не минус
             tail = _SWISS_TAIL.match(norm[end:])
-            raw = norm[start:end]
             pre = _marker_before(norm, start)
             after = end + (tail.end() if tail else 0)
             mult = _multiplier_after(norm, after)
             post_at = mult[1] if mult else after
             post = _marker_after(norm, post_at)
             # буква вплотную к числу без пробела — это слово («iPhone15»), если
-            # только сама буква не метка («USD50», «Rs.9»)
-            if prev.isalpha() and not pre:
-                continue
-            code, weak, span0, span1 = None, False, start, post_at
-            pick = None
+            # только сама буква не метка («USD50», «Rs.9»). Ценой слово не станет,
+            # но знак рядом может быть его: зачёркнутая «1299 руб.» читается как
+            # «i299 py6.», и её рубль не должен достаться следующей цене
+            word = prev.isalpha() and not pre
+            # метки, которые что-то значат: слабая без выбора валюты — не метка
+            marks = {}
             for found_marker, side in ((pre, "pre"), (post, "post")):
                 if not found_marker:
                     continue
-                codes, is_weak = MARKERS[(found_marker[0], side)]
+                token, edge = found_marker
+                codes, is_weak = MARKERS[(token, side)]
                 resolved = _resolve(codes, is_weak, source, context)
                 if not resolved:
+                    continue
+                if side == "pre":
+                    at, glued = (edge, edge + len(token)), edge + len(token) == start
+                else:
+                    at, glued = (edge - len(token), edge), edge - len(token) == post_at
+                marks[side] = {"token": token, "codes": codes, "code": resolved,
+                               "weak": is_weak, "at": at, "glued": glued}
+            nums.append({"start": start, "end": end, "after": after, "post_at": post_at,
+                         "mult": mult, "marks": marks, "word": word})
+
+        # Знак между двумя числами — одного из них, а не обоих: иначе «2499 $14.99»
+        # давало две цены в долларах, а у «999 ₽ 1 299 ₽» рамка второй цены
+        # наезжала на первую. Соседей ищем по месту знака, а не по порядку:
+        # между ними может оказаться цифра из самой метки — «6» из «py6.».
+        for i, b in enumerate(nums):
+            for a in nums[:i]:
+                post, pre = a["marks"].get("post"), b["marks"].get("pre")
+                if post and pre and post["at"][0] < pre["at"][1] and pre["at"][0] < post["at"][1]:
+                    if _sign_goes_right(a["marks"], b["marks"]):
+                        del a["marks"]["post"]
+                    else:
+                        del b["marks"]["pre"]
+
+        items = []
+        for num in nums:
+            if num["word"]:
+                continue
+            start, end, marks, mult = num["start"], num["end"], num["marks"], num["mult"]
+            raw = norm[start:end]
+            code, weak, span0, span1 = None, False, start, num["post_at"]
+            pick = None
+            for side in ("pre", "post"):
+                mark = marks.get(side)
+                if not mark:
                     continue
                 # «$29.99 USD»: общий знак спереди, точный код сзади — верим коду.
                 # «%1 299 ₽»: «%» — лишь догадка, что это испорченный «₹»,
                 # а знак сзади настоящий — верим знаку
-                rank = (found_marker[0] != "%", len(codes) == 1)
-                if pick is None or rank > pick[2]:
-                    pick = (resolved, side, rank, is_weak, found_marker)
+                rank = (mark["token"] != "%", len(mark["codes"]) == 1)
+                if pick is None or rank > pick[0]:
+                    pick = (rank, mark)
             if pick:
-                code, side, _, weak, marker = pick
-                if side == "pre":
-                    span0 = marker[1]
-                elif not pre or pre[0] == "%":
-                    span1 = marker[1]
-            if mult and not pick:
+                code, weak = pick[1]["code"], pick[1]["weak"]
+                # Рамка закрывает выбранный знак и второй, если он про ту же
+                # валюту: «$29.99 USD» — целиком, а от «%1299 ₽» — только «1299 ₽».
+                for side, mark in marks.items():
+                    if mark is pick[1] or code in mark["codes"]:
+                        if side == "pre":
+                            span0 = mark["at"][0]
+                        else:
+                            span1 = mark["at"][1]
+            elif mult:
                 mult = None             # «10 MB»: без валюты это не множитель
-                span1 = after
+                span1 = num["after"]
             try:
                 value = _parse_number(raw, code)
             except ValueError:
