@@ -9,7 +9,8 @@
 отрисовка, а из основного файла сюда приходит только снимок.
 
 По порядку работы:
-  1. read_lines  — распознаём область: стираем зачёркивания, достаём копейки,
+  1. read_lines  — распознаём область: тёмную карточку переворачиваем, бледную
+                   старую цену усиливаем, стираем зачёркивания, достаём копейки,
                    набранные мелко сверху, отдаём слова с рамками;
   2. find_prices — ищем в строках «знак валюты + число»;
   3. Rates       — курсы: ЦБ РФ, а чего у него нет — запасной источник; кэш на диске;
@@ -29,7 +30,7 @@ import xml.etree.ElementTree as ET
 import requests
 import pytesseract
 from pytesseract import Output
-from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 
 # --------------------------------------------------------------------------------------
@@ -152,10 +153,15 @@ def currency_name(code, russian):
 # числа слишком часто значит совсем другое («#12345» — номер заказа, «B590» —
 # модель ноутбука), поэтому слабая метка работает, только когда человек сам
 # назвал эту валюту «валютой на экране».
+#
+# Вместо «слабая ли» может стоять образец числа: метка работает, только если
+# число рядом на него похоже, иначе её нет вовсе. Так устроены двойники «€» и «₹».
 DOLLARS = ("USD", "SGD", "AUD", "CAD", "HKD", "NZD", "TWD", "MXN", "ARS", "CLP", "COP")
 YENS = ("JPY", "CNY")
 KRONAS = ("SEK", "NOK", "DKK", "ISK")
 RUPEES = ("INR", "PKR", "LKR", "NPR")
+_MONEY = re.compile(r"[.,]\d{2}$")                              # «79,99»
+_LAKH = re.compile(r"^\d{1,2}(?:,\d\d)+,\d{3}(?:\.\d\d)?$")     # «1,23,456.00»
 
 _MARKER_SPEC = [
     # --- доллары
@@ -225,6 +231,13 @@ _MARKER_SPEC = [
     (["₮"], ("MNT",), "any", False),
     (["₿"], ("BTC",), "any", False),
     (["USDC"], ("USDT",), "any", False),
+    # --- двойники: во что распознавание превращает «€» и «₹». Сами по себе
+    # эти значки о деньгах не говорят («© 2024», «~15 мин»), поэтому верим им,
+    # только когда число рядом записано как деньги: с копейками («79,99 ©»)
+    # или индийскими разрядами по два («~1,23,456.00» — так пишут только рупии)
+    (["©"], ("EUR",), "any", _MONEY),
+    (["E"], ("EUR",), "post", _MONEY),
+    (["~", "<", "X"], ("INR",), "pre", _LAKH),
     # --- слабые: что остаётся от редких знаков после распознавания
     (["#"], ("KRW", "TRY"), "pre", True),
     (["T", "Т"], ("KZT",), "post", True),
@@ -299,7 +312,8 @@ _UNITS_AFTER = re.compile(
     r"см\b|мм\b|м\b|км\b|кг\b|г\b|л\b|мл\b|ml\b|мин|min\b|h\b|ч\b|лет|years?|дн)",
     re.IGNORECASE)
 # Кольцо между числами диапазона: «$10–20», «от 1 500 до 3 000 ₽», «10 to 20 €».
-_RANGE_LINK = re.compile(r"^\s?(?:-|~|to|до)\s?$", re.IGNORECASE)
+# «go» и «no» — так «до» читает английская модель распознавания.
+_RANGE_LINK = re.compile(r"^\s?(?:-|~|to|до|go|no)\s?$", re.IGNORECASE)
 
 _KANA = re.compile(r"[\u3040-\u30ff]")
 _HAN = re.compile(r"[\u4e00-\u9fff]")
@@ -477,6 +491,10 @@ def find_prices(lines, source="auto"):
                 if not found_marker:
                     continue
                 codes, is_weak = MARKERS[(found_marker[0], side)]
+                if hasattr(is_weak, "search"):      # двойник знака: смотря какое число
+                    if not is_weak.search(raw):
+                        continue
+                    is_weak = False
                 resolved = _resolve(codes, is_weak, source, context)
                 if not resolved:
                     continue
@@ -610,6 +628,88 @@ def _is_dark(gray):
     return sum(hist[:128]) > sum(hist[128:])
 
 
+def _strip_frame(gray):
+    """Полоса страницы вокруг карточки — закрашиваем её фоном самой карточки.
+
+    Тёмную карточку («$14.99» в магазине игр) обводят с запасом, и в снимок
+    попадает светлая страница вокруг. Распознавание видит светлую рамку с
+    тёмным пятном внутри и не читает в пятне ничего. Рамку узнаём по краям:
+    строки и столбцы от края внутрь, почти целиком непохожие на фон середины.
+    Строка текста такой не бывает — между буквами всегда виден фон.
+    """
+    w, h = gray.size
+    if w < 16 or h < 16:
+        return gray
+    hist = gray.crop((w // 5, h // 5, w - w // 5, h - h // 5)).histogram()
+    bg = max(range(256), key=hist.__getitem__)
+    data = gray.point(lambda v: 255 if abs(v - bg) > 60 else 0).tobytes()
+
+    def framed(line, size):
+        return line.count(255) >= 0.9 * size
+
+    top, bottom, left, right = 0, h, 0, w
+    while top < h // 3 and framed(data[top * w:(top + 1) * w], w):
+        top += 1
+    while bottom > h - h // 3 and framed(data[(bottom - 1) * w:bottom * w], w):
+        bottom -= 1
+    while left < w // 3 and framed(data[left::w], h):
+        left += 1
+    while right > w - w // 3 and framed(data[right - 1::w], h):
+        right -= 1
+    if (top, bottom, left, right) == (0, h, 0, w):
+        return gray
+    out = Image.new("L", (w, h), bg)
+    out.paste(gray.crop((left, top, right, bottom)), (left, top))
+    return out
+
+
+# Насколько тёмная самая тёмная точка рядом (от фона, 0–255) -> во сколько раз
+# усилить чернила. Слабее 60 — рамки и тени, а не буквы. От 165 — буквы и так
+# тёмные: тонкие штрихи чёрного мелкого шрифта после увеличения бывают как
+# раз такими, и усиливать их нельзя — распознавание начинало путать «5» и «S».
+_BOOST_BANDS = [(60, 100, 2.5), (100, 120, 2.3), (120, 140, 2.0), (140, 165, 1.7)]
+
+
+def _boost_faint(gray):
+    """Бледно-серые буквы рядом с чёрными — такими же тёмными, как чёрные.
+
+    Старую цену магазины пишут светло-серым, новую — чёрным или красным.
+    Общая растяжка контраста равняется по чёрной, и серая остаётся серой:
+    точка в «$29.99» у мелкого шрифта выходила бледным пятнышком, и
+    распознавание читало «$2999», а бледную линию зачёркивания не находило.
+    Поэтому усиливаем каждую точку по самой тёмной точке в её окрестности:
+    у чёрных букв она чёрная, и они не меняются вместе со своей каймой, а
+    серые темнеют до чёрного. Общее усиление всей картинки серым тоже
+    помогало, но портило чёрные: «50EUR» читалось как «SOEUR».
+    """
+    ink = ImageOps.invert(gray)                 # чернила светлые, фон тёмный
+    hist = ink.histogram()
+    bg = max(range(256), key=hist.__getitem__)
+    # Самое тёмное в окрестности ~9×9. Окно шире задевало места, где бледная
+    # линия зачёркивания пересекает бледную цифру: там темнее, и линия рядом
+    # переставала усиливаться. Считаем на копии втрое меньше: на снимке во
+    # весь экран фильтр по полной картинке шёл почти секунду.
+    # Уменьшаем не усреднением, а максимумом по клеткам 3×3 — из девяти
+    # выборок каждой третьей точки со сдвигом, — и тонкий штрих не бледнеет.
+    w, h = ink.size
+    w3, h3 = -(-w // 3) * 3, -(-h // 3) * 3
+    pad = ink.crop((-1, -1, w3 + 2, h3 + 2))
+    peak = None
+    for dy in range(3):
+        for dx in range(3):
+            part = pad.resize((w3 // 3, h3 // 3), Image.NEAREST, box=(dx, dy, dx + w3, dy + h3))
+            peak = part if peak is None else ImageChops.lighter(peak, part)
+    peak = peak.filter(ImageFilter.MaxFilter(3))
+    peak = peak.resize((w3, h3), Image.NEAREST).crop((0, 0, w, h))
+    out = ink
+    for lo, hi, gain in _BOOST_BANDS:
+        mask = peak.point(lambda v: 255 if lo <= v - bg < hi else 0)
+        if mask.getbbox():
+            out = Image.composite(
+                ink.point(lambda v: min(255, bg + int(max(0, v - bg) * gain))), out, mask)
+    return ImageOps.invert(out)
+
+
 def erase_strikes(gray, min_len, max_thick):
     """Стираем тонкие горизонтальные линии: зачёркивание старой цены и подчёркивания.
 
@@ -629,12 +729,22 @@ def erase_strikes(gray, min_len, max_thick):
     dark = _is_dark(gray)
     mask = gray.point(lambda v: 255 if (v > 128) == dark else 0)   # чернила — 255
     data = mask.tobytes()
-    run_re = re.compile(rb"\xff{%d,}" % max(2, int(min_len)))
+    # Линию собираем из кусков: там, где её пересекает штрих цифры, от
+    # сглаживания в ней бывает просвет в пиксель-два. Целиком она тогда не
+    # находилась, и зачёркнутая «$1,299.99» не считалась старой ценой.
+    gap = 2
+    piece_re = re.compile(rb"\xff{%d,}" % max(2, int(min_len) // 4))
     runs = []
     for y in range(h):
         base = y * w
-        for m in run_re.finditer(data, base, base + w):
-            runs.append([m.start() - base, m.end() - base, y, y])
+        row = []
+        for m in piece_re.finditer(data, base, base + w):
+            a, b = m.start() - base, m.end() - base
+            if row and a - row[-1][1] <= gap:
+                row[-1][1] = b
+            else:
+                row.append([a, b, y, y])
+        runs += [r for r in row if r[1] - r[0] >= min_len]
     # соседние строки одной линии — одна линия толщиной в несколько пикселей
     lines = []
     for run in runs:
@@ -651,7 +761,16 @@ def erase_strikes(gray, min_len, max_thick):
     out = gray.copy()
     po = out.load()
     bg = 0 if dark else 255
+    halo = gray.point(lambda v: 255 if (v > 60 if dark else v < 195) else 0).tobytes()
     for x0, x1, y0, y1 in thin:
+        # Размытый край линии стираем вместе с ней. Браузер кладёт линию не
+        # по целым пикселям, и бледная кайма над и под ней оставалась на
+        # снимке второй линией, а пересечения со штрихами цифр проверялись по
+        # кайме, а не по самой цифре.
+        while y0 > 0 and _halo_row(halo, w, y0 - 1, x0, x1):
+            y0 -= 1
+        while y1 + 1 < h and _halo_row(halo, w, y1 + 1, x0, x1):
+            y1 += 1
         for x in range(x0, x1):
             above = y0 > 0 and data[(y0 - 1) * w + x]
             below = y1 + 1 < h and data[(y1 + 1) * w + x]
@@ -660,6 +779,11 @@ def erase_strikes(gray, min_len, max_thick):
             for y in range(y0, y1 + 1):
                 po[x, y] = bg
     return out, [(x0, x1, y0, y1) for x0, x1, y0, y1 in thin]
+
+
+def _halo_row(halo, w, y, x0, x1):
+    """Строка над (под) линией — её размытый край: бледные чернила почти во всю длину."""
+    return halo[y * w + x0:y * w + x1].count(255) >= 0.85 * (x1 - x0)
 
 
 def _raised_tail(gray, box):
@@ -726,6 +850,26 @@ def _read_cents(gray, x_from, box):
     return got if re.fullmatch(r"\d{1,2}", got) else None
 
 
+# Слово уже похоже на цену: знак валюты вплотную к цифрам и копейки после точки
+_PRICE_SHAPE = re.compile(r"[$€£¥₹₽]\d.*[.,]\d\d$|^\d.*[.,]\d\d[$€£¥₹₽]$")
+
+
+def _reread(clean, box, langs):
+    """Прочитать одно слово отдельно от строки (рамка — в пикселях `clean`)."""
+    x0, y0, x1, y1 = box
+    m = max(3, (y1 - y0) // 3)
+    crop = clean.crop((max(0, x0 - 2), max(0, y0 - m), min(clean.width, x1 + 2),
+                       min(clean.height, y1 + m)))
+    crop = ImageOps.expand(crop, border=12, fill=0 if _is_dark(crop) else 255)
+    try:
+        got = pytesseract.image_to_string(crop, lang=langs, config="--oem 3 --psm 7")
+    except Exception:
+        return None
+    # мелкую точку одну распознавание нередко видит двоеточием: «$29:99»
+    got = re.sub(r"(?<=\d)[:;](?=\d\d$)", ".", got.strip())
+    return got if got and " " not in got else None
+
+
 def read_lines(img, langs="eng", scale=2.0):
     """Распознать снимок -> строки слов: [[{text, box, conf, strike}, ...], ...].
 
@@ -735,9 +879,16 @@ def read_lines(img, langs="eng", scale=2.0):
     Однострочной полоске лучше «psm 7».
     """
     scale = scale if img.height * scale < 4000 else 1.0
+    # BICUBIC, а не LANCZOS: на снимках страниц из Chrome при масштабах экрана
+    # 100–150 % с ним ошибок распознавания заметно меньше
     big = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))),
-                     Image.LANCZOS) if scale != 1.0 else img
-    gray = ImageOps.autocontrast(big.convert("L"))
+                     Image.BICUBIC) if scale != 1.0 else img
+    gray = _strip_frame(ImageOps.autocontrast(big.convert("L")))
+    if _is_dark(gray):
+        # светлые буквы на тёмном — переворачиваем: распознавание читает
+        # тёмное по светлому, а белую цену на чёрной плашке порой не видит вовсе
+        gray = ImageOps.invert(gray)
+    gray = _boost_faint(ImageOps.autocontrast(gray))
     # линия зачёркивания — от 20 px в длину и не толще 3 px на исходном снимке
     clean, strikes = erase_strikes(gray, int(20 * scale), max(2, int(round(3 * scale))))
     psm = 7 if img.height < 40 else 6
@@ -754,6 +905,19 @@ def read_lines(img, langs="eng", scale=2.0):
             continue
         x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
         box = (x, y, x + w, y + h)
+        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
+        row = rows.setdefault(key, [])
+        # «$19⁹⁹» распознавание порой режет на два слова — «$1» и «9°9»: у
+        # жирной «1» справа широкий просвет. Цифра вплотную к цифре, а в конце
+        # висят копейки — это одно слово, и цена одна: $19.99, а не $1.
+        if row and row[-1][0]["text"][-1:].isdigit() and word[0].isdigit():
+            prev, pbox = row[-1]
+            joined = (pbox[0], min(pbox[1], y), x + w, max(pbox[3], y + h))
+            if 0 <= x - pbox[2] <= 0.3 * (joined[3] - joined[1]) \
+                    and _raised_tail(clean, joined) is not None:
+                row.pop()
+                word, box, conf = prev["text"] + word, joined, min(conf, prev["conf"])
+                x, y, w, h = joined[0], joined[1], joined[2] - joined[0], joined[3] - joined[1]
         # зачёркнута, если линия прошла через среднюю часть слова почти во всю его ширину
         strike = any(min(x + w, sx1) - max(x, sx0) >= 0.6 * w
                      and y + 0.25 * h <= sy0 <= y + 0.8 * h
@@ -769,11 +933,30 @@ def read_lines(img, langs="eng", scale=2.0):
                         if digits.endswith(cents) and len(digits) > len(cents):
                             digits = digits[:-len(cents)]
                         word = f"{head.group(1)}{digits}.{cents.ljust(2, '0')}"
-        key = (data["block_num"][i], data["par_num"][i], data["line_num"][i])
-        rows.setdefault(key, []).append({
-            "text": word, "conf": conf, "strike": strike,
-            "box": tuple(int(round(v / scale)) for v in box)})
-    lines = [sorted(ws, key=lambda w: w["box"][0]) for ws in rows.values()]
+        row.append(({"text": word, "conf": conf, "strike": strike,
+                     "box": tuple(int(round(v / scale)) for v in box)}, box))
+    # Мелкая старая цена в одной строке с крупной новой: распознавание
+    # подгоняет всю строку под крупную, мелкая ужимается, и точка из «$29.99»
+    # пропадает — выходит «$2999», в сто раз дороже, а «$» под линией
+    # становится «5»: «529.99». Такое слово перечитываем отдельно и берём
+    # новое прочтение, только если оно похоже на цену, а цифры те же — или
+    # те же без первой, которая и была знаком валюты. Каждое перечитывание —
+    # ещё четверть секунды, поэтому их не больше трёх, зачёркнутые — первыми.
+    small = []
+    for ws in rows.values():
+        tall = max((b[3] - b[1] for wd, b in ws if re.search(r"\d", wd["text"])), default=0)
+        small += [(wd, b) for wd, b in ws
+                  if len(re.sub(r"\D", "", wd["text"])) >= 3 and b[3] - b[1] < 0.75 * tall
+                  and not _PRICE_SHAPE.search(wd["text"])]
+    small.sort(key=lambda wb: not wb[0]["strike"])
+    for wd, b in small[:3]:
+        old, again = wd["text"], _reread(clean, b, langs)
+        if not again or not _PRICE_SHAPE.search(again):
+            continue
+        was, now = re.sub(r"\D", "", old), re.sub(r"\D", "", again)
+        if now == was or (now == was[1:] and old[0].isdigit() and not again[0].isdigit()):
+            wd["text"] = again
+    lines = [sorted((wd for wd, _ in ws), key=lambda w: w["box"][0]) for ws in rows.values()]
     lines.sort(key=lambda ws: (min(w["box"][1] for w in ws), ws[0]["box"][0]))
     return lines
 
