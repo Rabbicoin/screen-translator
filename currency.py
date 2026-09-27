@@ -290,6 +290,13 @@ _NORM = str.maketrans({
 # разрядов, поэтому внутри числа он только перед ровно тремя цифрами:
 # «1 299,99» — одно число, а «4.8 0 (1,234» — три разных.
 _NUM = re.compile(r"\d(?:\d|[.,'](?=\d)| (?=\d{3}(?!\d)))*")
+# Метки с цифрой внутри — «py6», так английская модель читает «руб»:
+# (метка, где в ней цифры начинаются, где кончаются)
+_DIGIT_MARKS = []
+for _token in sorted({t for t, _ in MARKERS}):
+    _digits = re.search(r"\d+", _token)
+    if _digits:
+        _DIGIT_MARKS.append((_token, _digits.start(), _digits.end()))
 _SWISS_TAIL = re.compile(r"^[.,]-{1,2}")      # «49.–», «49,-»: без копеек
 
 # Что стоит перед числом и делает его не ценой: номер, счётчик, код.
@@ -338,6 +345,31 @@ def _parse_number(raw, code_hint=None):
             frac = s[seps[-1][0] + 1:]
             return float(f"{int_part or '0'}.{frac}")
     return float(s.replace(".", "").replace(",", "").replace("'", "").replace(" ", ""))
+
+
+def _numbers(text):
+    """Числа в строке: (начало, конец) каждого.
+
+    Число, начатое цифрой метки, на этой цифре и кончается: в «1 299 py6 999 руб»
+    пробел перед тремя цифрами склеивал «6» из «py6» с 999 в «6 999», это число
+    отбрасывалось как слово, и цена 999 пропадала. Теперь «6» — отдельное число,
+    как в «py6. 999», а 999 — своё.
+    """
+    pos = 0
+    while True:
+        m = _NUM.search(text, pos)
+        if not m:
+            return
+        start, end = m.span()
+        for token, d0, d1 in _DIGIT_MARKS:
+            at = start - d0
+            # метка стоит отдельно, как в _marker_before: «copy6» — не «py6»
+            if at >= 0 and text.startswith(token, at) \
+                    and not (at and text[at - 1].isalpha()):
+                end = min(end, at + d1)
+                break
+        yield start, end
+        pos = end
 
 
 def _marker_before(text, pos):
@@ -477,8 +509,7 @@ def find_prices(lines, source="auto"):
         text, spans = _line_text(line)
         norm = text.translate(_NORM)
         nums = []
-        for m in _NUM.finditer(norm):
-            start, end = m.start(), m.end()
+        for start, end in _numbers(norm):
             prev = norm[start - 1] if start else " "
             if prev.isdigit():
                 continue
