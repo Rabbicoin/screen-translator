@@ -25,6 +25,13 @@ promo_cache.json
 
 # Сохранённые курсы валют для пересчёта цен — обновляются сами
 currency_rates.json
+# образцы редких знаков валют: рисуются из шрифтов Windows при первом пересчёте
+currency_signs.cache
+# стенд пересчёта в Chrome: снимки и результаты прогонов пересоздаются за минуту
+tests/bench/shots/
+tests/bench/bench_*.json
+tests/bench/*.pkl
+tests/bench/trace.png
 
 # Локальные настройки Claude Code — своё для каждого компьютера
 .claude/
