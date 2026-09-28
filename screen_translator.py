@@ -4670,6 +4670,7 @@ class Toast:
 COMMA_LANGS = {"ru", "be", "kk", "uk", "de", "fr", "es", "it", "pt", "pl", "cs", "tr",
                "nl", "sv", "id", "vi"}
 RATES_PATH = data_file("currency_rates.json")
+currency.SIGNS_CACHE = data_file("currency_signs.cache")   # образцы редких знаков валют
 
 
 def currency_targets():
