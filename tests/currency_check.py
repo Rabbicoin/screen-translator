@@ -46,6 +46,7 @@ CASES = [
     ("S$25.00", "", "auto", [(25, "SGD", False)]),
     ("A$49.95", "", "auto", [(49.95, "AUD", False)]),
     ("CA$30", "", "auto", [(30, "CAD", False)]),
+    ("C$100", "", "auto", [(100, "CAD", False)]),
     ("HK$388", "", "auto", [(388, "HKD", False)]),
     ("US$99", "", "auto", [(99, "USD", False)]),
     ("R$ 59,90", "", "auto", [(59.9, "BRL", False)]),
