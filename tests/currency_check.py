@@ -26,9 +26,10 @@ FONTS = os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts")
 
 # (текст, стиль, валюта на экране, ожидаемое [(сумма, код, зачёркнута[, рамка])])
 # стиль: "" — обычный, "big" — крупная жирная цена, "sup" — копейки мелко сверху
-# после «|», "strike" — первая цена зачёркнута. Пустой список — «не трогать».
-# Рамка — что закроет пересчёт, как это прочло распознавание («₽» оно читает
-# как «P»); где её нет, рамку не сверяем.
+# после «|», "strike" — первая цена зачёркнута, "web:…" и "dark:…" — старая и
+# новая цена через «|», нарисованные как в браузере (draw_web). Пустой список —
+# «не трогать». Рамка — что закроет пересчёт, как это прочло распознавание
+# («₽» оно читает как «P»); где её нет, рамку не сверяем.
 CASES = [
     # разделители
     ("149,99 SGD (includes GST)", "", "auto", [(149.99, "SGD", False)]),
@@ -95,7 +96,11 @@ CASES = [
     # знак между двумя числами — одного из них: к какому прижат, а если ни к
     # какому — с той стороны, где эту валюту пишут
     ("2499 $14.99", "strike", "auto", [(14.99, "USD", False)]),
-    ("40$ 25$", "strike", "auto", [(40, "USD", True), (25, "USD", False)]),
+    # Здесь проверяется, чей знак, а не зачёркивание: нарисованную зачёркнутую
+    # «40$» после увеличения BICUBIC с усилением бледного распознавание читает
+    # «403». На снимках Chrome оба приёма дают больше верного, а «40$» с линией,
+    # нарисованной как в Chrome, не читалась и прежним кодом («46», «40%»).
+    ("40$ 25$", "", "auto", [(40, "USD", False), (25, "USD", False)]),
     ("999 ₽ 1 299 ₽", "", "auto", [(999, "RUB", False, "999 P"), (1299, "RUB", False, "1 299 P")]),
     ("1299₽ 999₽", "", "auto", [(1299, "RUB", False, "1299P"), (999, "RUB", False, "999P")]),
     ("1 299 руб. 999 руб.", "", "auto",
@@ -140,6 +145,23 @@ CASES = [
     ("1 299", "", "auto", []),
     ("1 299", "", "RUB", [(1299, "RUB", False)]),
     ("0.005 BTC", "", "auto", [(0.005, "BTC", False)]),
+    # так распознавание видит «€» и «₹», и так «до»: двойникам знаков верим,
+    # только когда число записано как деньги
+    ("Save 20% — now 79,99 ©", "", "auto", [(79.99, "EUR", False)]),
+    ("© 2024 Shop", "", "EUR", []),
+    ("~1,23,456.00", "", "auto", [(123456, "INR", False)]),
+    ("~1,500 km", "", "auto", []),
+    ("от 1 500 go 3 000 ₽", "", "auto", [(1500, "RUB", False), (3000, "RUB", False)]),
+    # как в браузере (см. draw_web): серая старая цена мелко рядом с крупной
+    # новой теряла точку — «$2499»; тёмная карточка со светлой страницей
+    # вокруг не читалась вовсе или старая цена не считалась старой
+    ("$24.99|$14.99", "web:1.5:0:3", "auto", [(24.99, "USD", True), (14.99, "USD", False)]),
+    ("$24.99|$14.99", "web:1.5:0.6:12", "auto", [(24.99, "USD", True), (14.99, "USD", False)]),
+    ("$29.99|$19.99", "dark:1:0:12", "auto", [(29.99, "USD", True), (19.99, "USD", False)]),
+    ("$29.99|$19.99", "dark:1.25:0:12", "auto", [(29.99, "USD", True), (19.99, "USD", False)]),
+    ("$24.99|$14.99", "dark:1.25:0:3", "auto", [(24.99, "USD", True), (14.99, "USD", False)]),
+    ("$29.99|$19.99", "dark:1.5:0:12", "auto", [(29.99, "USD", True), (19.99, "USD", False)]),
+    ("$24.99|$14.99", "dark:1.5:0.6:3", "auto", [(24.99, "USD", True), (14.99, "USD", False)]),
 ]
 
 
@@ -150,8 +172,53 @@ def _font(text, size, bold=False):
                               size)
 
 
+def draw_web(text, style):
+    """Старая и новая цена «как в браузере»: стиль «web:масштаб:сдвиг:поле».
+
+    «web» — белая карточка, «dark» — тёмная, как в магазине игр. Масштаб —
+    как масштаб экрана Windows (1.25 — 125 %), сдвиг — доля пикселя, на
+    которую карточка стоит не по сетке, поле — сколько страницы вокруг
+    карточки попало в выделение. Страница вокруг светлая и у тёмной
+    карточки: такую рамку распознавание и не переваривало.
+
+    Chrome зачёркивает иначе, чем PIL у случая «strike»: линия на трети
+    верхнего выноса шрифта над строкой, то есть ниже середины цифр, толщиной
+    в 1/14 кегля. Верх линии у него на целом пикселе экрана, а толщина — нет:
+    при 125 и 150 % под линией остаётся размытая кайма. Рисуем вчетверо
+    крупнее и уменьшаем: так выходят и дробные позиции букв, и сглаживание.
+    """
+    kind, zoom, phase, margin = style.split(":")
+    zoom, phase, margin = float(zoom), float(phase), int(margin)
+    old, new = text.split("|")
+    ss = 4
+    k = zoom * ss
+    if kind == "dark":
+        card, c_old, c_new = (27, 40, 56), (115, 139, 149), (190, 238, 17)
+        f_new = ImageFont.truetype(os.path.join(FONTS, "arialbd.ttf"), round(20 * k))
+    else:
+        card, c_old, c_new = (255, 255, 255), (118, 118, 118), (200, 30, 30)
+        f_new = ImageFont.truetype(os.path.join(FONTS, "segoeuib.ttf"), round(22 * k))
+    f_old = ImageFont.truetype(os.path.join(FONTS, "arial.ttf"), round(14 * k))
+    w_old, w_new = f_old.getlength(old), f_new.getlength(new)
+    asc_old, asc_new = f_old.getmetrics()[0], f_new.getmetrics()[0]
+    cw, ch = int((36 + 12) * k + w_old + w_new), int((28 + 26.4) * k)
+    m, off = margin * zoom * ss, phase * ss
+    img = Image.new("RGB", (int(cw + 2 * m), int(ch + 2 * m)), (238, 240, 236))
+    d = ImageDraw.Draw(img)
+    d.rectangle((m, m, m + cw - 1, m + ch - 1), fill=card)
+    base, x = m + 14 * k + off + asc_new, m + 18 * k + off
+    d.text((x, base - asc_old), old, font=f_old, fill=c_old)
+    t = max(ss, 14 * k * 0.073)
+    top = round((base - asc_old / 3 - t / 2) / ss) * ss
+    d.rectangle((x, top, x + w_old, top + t - 1), fill=c_old)
+    d.text((x + w_old + 12 * k, base - asc_new), new, font=f_new, fill=c_new)
+    return img.resize((img.width // ss, img.height // ss), Image.BOX)
+
+
 def draw_case(text, style):
     """Цена картинкой: белый фон, шрифт сайта, как её выделили бы мышью."""
+    if style.startswith(("web:", "dark:")):
+        return draw_web(text, style)
     pad, ink = 10, (32, 33, 36)
     img = Image.new("RGB", (600, 80), "white")
     d = ImageDraw.Draw(img)
@@ -178,6 +245,11 @@ def draw_case(text, style):
     return img.crop((0, 0, int(right) + pad, bottom + pad // 2))
 
 
+# Рамку сверяем без разницы, какой азбукой прочитаны одинаковые на вид буквы:
+# «1299Р» и «1299P», «руб.» и «py6.» закрывают одно и то же место.
+_TWINS = str.maketrans("АВЕКМНОРСТХаеорсухб", "ABEKMHOPCTXaeopcyx6")
+
+
 def main():
     bad = 0
     for text, style, source, want in CASES:
@@ -185,13 +257,16 @@ def main():
         langs = "eng+chi_sim" if any(ord(c) > 0x2E80 for c in text) else "eng+rus"
         lines = currency.read_lines(img, langs)
         box = any(len(w) > 3 for w in want)
-        got = [(round(p.amount, 6), p.code, p.strike) + ((p.text,) if box else ())
+        got = [(round(p.amount, 6), p.code, p.strike) + ((p.text.translate(_TWINS),) if box else ())
                for p in currency.find_prices(lines, source)]
-        ok = got == [(round(w[0], 6),) + tuple(w[1:]) for w in want]
+        ok = got == [(round(w[0], 6),) + tuple(w[1:3]) + tuple(t.translate(_TWINS) for t in w[3:])
+                     for w in want]
         bad += not ok
         read = " | ".join(" ".join(w["text"] for w in ln) for ln in lines)
         mark = "ok" if ok else "!!"
-        print(f"[{mark}] {text.replace('|', ''):28} {source:5} прочитано {read!r:30} "
+        label = text.replace("|", "" if style == "sup" else " ") + \
+            (f" {style}" if ":" in style else "")
+        print(f"[{mark}] {label:28} {source:5} прочитано {read!r:30} "
               f"найдено {got}" + ("" if ok else f"   ждали {want}"))
     print(f"\nрасхождений: {bad} из {len(CASES)}")
     return 1 if bad else 0
