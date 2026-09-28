@@ -509,9 +509,10 @@ def find_prices(lines, source="auto"):
         text, spans = _line_text(line)
         norm = text.translate(_NORM)
         nums = []
+        taken = 0                   # до сюда строка уже разобрана: копейки «19€99»
         for start, end in _numbers(norm):
             prev = norm[start - 1] if start else " "
-            if prev.isdigit():
+            if prev.isdigit() or start < taken:
                 continue
             # хвост «.–» у швейцарских цен — часть числа, а не минус
             tail = _SWISS_TAIL.match(norm[end:])
@@ -520,6 +521,25 @@ def find_prices(lines, source="auto"):
             mult = _multiplier_after(norm, after)
             post_at = mult[1] if mult else after
             post = _marker_after(norm, post_at)
+            # «Qty 2 $14.99», «Size 10 $49.99»: знак через пробел, но вплотную к
+            # следующему числу — это его знак, а само число — количество или
+            # размер, не цена. «14,99 $» — по-старому, слитное «19€99» — ниже.
+            if post and norm[post_at:post_at + 1] == " " \
+                    and norm[post[1]:post[1] + 1].isdigit() and _marker_before(norm, post[1]):
+                if not pre:
+                    continue
+                post = None
+            # «19€99» — так пишут во Франции и Бельгии: знак стоит на месте
+            # запятой, и две цифры за ним — копейки этой же цены, а не вторая
+            # цена «€99». Только знак, вплотную с обеих сторон, и ровно две цифры.
+            raw, cents_end = norm[start:end], None
+            if post and not pre and post_at == end and post[1] == end + len(post[0]) \
+                    and not any(ch.isalnum() for ch in post[0]) \
+                    and not re.search(r"[.,]\d{1,2}$", raw):
+                cents = _NUM.match(norm, post[1])
+                if cents and len(cents.group()) == 2:
+                    raw = f"{raw}.{cents.group()}"
+                    cents_end = taken = cents.end()
             # буква вплотную к числу без пробела — это слово («iPhone15»), если
             # только сама буква не метка («USD50», «Rs.9»). Ценой слово не станет,
             # но знак рядом может быть его: зачёркнутая «1299 руб.» читается как
@@ -539,10 +559,12 @@ def find_prices(lines, source="auto"):
                     at, glued = (edge, edge + len(token)), edge + len(token) == start
                 else:
                     at, glued = (edge - len(token), edge), edge - len(token) == post_at
+                if side == "post" and cents_end:
+                    at = (at[0], cents_end)             # копейки — в рамку цены
                 marks[side] = {"token": token, "codes": codes, "code": resolved,
                                "weak": is_weak, "at": at, "glued": glued}
             nums.append({"start": start, "end": end, "after": after, "post_at": post_at,
-                         "mult": mult, "marks": marks, "word": word})
+                         "mult": mult, "marks": marks, "word": word, "raw": raw})
 
         # Знак между двумя числами — одного из них, а не обоих: иначе «2499 $14.99»
         # давало две цены в долларах, а у «999 ₽ 1 299 ₽» рамка второй цены
@@ -562,7 +584,7 @@ def find_prices(lines, source="auto"):
             if num["word"]:
                 continue
             start, end, marks, mult = num["start"], num["end"], num["marks"], num["mult"]
-            raw = norm[start:end]
+            raw = num["raw"]
             code, weak, span0, span1 = None, False, start, num["post_at"]
             pick = None
             for side in ("pre", "post"):
