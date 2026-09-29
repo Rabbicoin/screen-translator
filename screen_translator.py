@@ -146,7 +146,7 @@ DEFAULT_CONFIG = {
     # с сайта, пока оно есть, показывается вместо неё — у новости срок годности,
     # у контактов его нет. Пусто — строки не будет вовсе.
     "footer_text": "Вопросы и пожелания: "
-                    "[Telegram @rabbiecho](https://t.me/rabbiecho) · "
+                    "[группа в Telegram](https://t.me/sevdevel) · "
                     "[sevdev.ru](https://sevdev.ru)",
     # Запасная ссылка на всю строку — работает, если в тексте нет ссылок в скобках.
     "footer_url": "https://sevdev.ru",
@@ -168,6 +168,20 @@ DEFAULT_CONFIG = {
 # --------------------------------------------------------------------------------------
 #  Конфиг
 # --------------------------------------------------------------------------------------
+# Прежние значения по умолчанию. Первый запуск записывает в config.json все
+# настройки целиком, так что новое значение из кода до тех, у кого программа
+# уже стоит, само не дойдёт. Если человек строку не менял — в ней одно из этих,
+# и её подменяем на нынешнюю; свою не трогаем. Контакты сменились 29.09.2026:
+# личный Telegram -> группа SevDev.
+_OLD_DEFAULTS = {
+    "footer_text": (
+        "Вопросы и пожелания: Telegram @rabbiecho · sevdev.ru",
+        "Вопросы и пожелания: [Telegram @rabbiecho](https://t.me/rabbiecho) · "
+        "[sevdev.ru](https://sevdev.ru)",
+    ),
+}
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     if os.path.exists(CONFIG_PATH):
@@ -178,6 +192,9 @@ def load_config():
             print("config.json повреждён, используются настройки по умолчанию")
     else:
         save_config(cfg)
+    for key, olds in _OLD_DEFAULTS.items():
+        if cfg.get(key) in olds:
+            cfg[key] = DEFAULT_CONFIG[key]
     return cfg
 
 
