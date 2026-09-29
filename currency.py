@@ -256,6 +256,7 @@ _MARKER_SPEC = [
 # Латинские буквы, у которых есть русские двойники. Смешанный набор языков
 # читает «A$» как «А$» с русской «А», и знак переставал узнаваться.
 _CYR_TWIN = str.maketrans("ABCEHKMOPTXacepoxy", "АВСЕНКМОРТХасероху")
+_LATIN_TWIN = str.maketrans("АВСЕНКМОРТХасероху", "ABCEHKMOPTXacepoxy")
 
 
 def _build_markers():
@@ -1275,7 +1276,9 @@ def _sure_mark(text, side):
     else:
         found = _marker_before(s, len(s))
         token = s[found[1]:] if found else None
-    return bool(token) and token.strip() not in _UNSURE_MARKS
+    # русские двойники латинских букв сомнительны так же: с русской моделью
+    # «₹29,990» читалось «Х29,990» с русской «Х», и знак не сверялся вовсе
+    return bool(token) and token.strip().translate(_LATIN_TWIN) not in _UNSURE_MARKS
 
 
 _SIGNIFICANT = re.compile(r"[^.,'\s]")
