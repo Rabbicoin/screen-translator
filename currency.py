@@ -326,8 +326,8 @@ _UNITS_AFTER = re.compile(
     r"см\b|мм\b|м\b|км\b|кг\b|г\b|л\b|мл\b|ml\b|мин|min\b|h\b|ч\b|лет|years?|дн)",
     re.IGNORECASE)
 # Кольцо между числами диапазона: «$10–20», «от 1 500 до 3 000 ₽», «10 to 20 €».
-# «go» и «no» — так «до» читает английская модель распознавания.
-_RANGE_LINK = re.compile(r"^\s?(?:-|~|to|до|go|no)\s?$", re.IGNORECASE)
+# «go», «no» и «fo» — так «до» читает английская модель распознавания.
+_RANGE_LINK = re.compile(r"^\s?(?:-|~|to|до|go|no|fo)\s?$", re.IGNORECASE)
 
 _KANA = re.compile(r"[\u3040-\u30ff]")
 _HAN = re.compile(r"[\u4e00-\u9fff]")
@@ -1354,6 +1354,34 @@ def _recheck_digits(clean, text, pieces, side, dtop, dbottom):
     return "".join(chars)
 
 
+def _dollar_or_s(rows, clean):
+    """«$» и «S» распознавание путает: «R$100» читалось «RS100» — рупии вместо
+    реалов, «SG$100» — «$G$100», доллары США. Различаем по картинке: черта «$»
+    выходит выше и ниже цифр, а «S» ростом с них. Правим, только когда куски
+    картинки и буквы слова сопоставляются один к одному.
+    """
+    for row in rows.values():
+        for wd, b in row:
+            text = wd["text"]
+            if not re.search(r"\d", text) or not re.search(r"[S$]", text):
+                continue
+            blobs = _blobs(clean, b)
+            band = _digit_band(blobs)
+            if len(blobs) != len(text) or not band:
+                continue
+            dtop, dbottom = band
+            dh = max(1, dbottom - dtop)
+            chars = list(text)
+            for i, (ch, g) in enumerate(zip(text, blobs)):
+                sticks_out = g[1] <= dtop - 0.1 * dh and g[3] >= dbottom + 0.1 * dh
+                flush = abs(g[1] - dtop) <= 0.05 * dh and abs(g[3] - dbottom) <= 0.05 * dh
+                if ch == "S" and sticks_out:
+                    chars[i] = "$"
+                elif ch == "$" and flush and text[i + 1:i + 2].isalpha():
+                    chars[i] = "S"                  # «$G$100»: первый — буква
+            wd["text"] = "".join(chars)
+
+
 def _find_rare_signs(rows, clean, scale):
     """Узнаём редкие знаки у чисел и вписываем их в слова строки.
 
@@ -1639,6 +1667,7 @@ def read_lines(img, langs="eng", scale=2.0):
         was, now = re.sub(r"\D", "", old), re.sub(r"\D", "", again)
         if now == was or (now == was[1:] and old[0].isdigit() and not again[0].isdigit()):
             wd["text"] = again
+    _dollar_or_s(rows, clean)
     _find_rare_signs(rows, clean, scale)
     lines = [sorted((wd for wd, _ in ws), key=lambda w: w["box"][0]) for ws in rows.values()]
     lines.sort(key=lambda ws: (min(w["box"][1] for w in ws), ws[0]["box"][0]))
