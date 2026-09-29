@@ -176,7 +176,8 @@ _MARKER_SPEC = [
     (["C$", "c$", "©$", "CA$", "Can$"], ("CAD",), "any", False),
     (["HK$"], ("HKD",), "any", False),
     (["NZ$"], ("NZD",), "any", False),
-    (["NT$"], ("TWD",), "any", False),
+    # «NT$» шрифтом Calibri читается «NTS$», и выходил доллар США
+    (["NT$", "NTS$"], ("TWD",), "any", False),
     (["MX$", "Mex$"], ("MXN",), "any", False),
     (["R$"], ("BRL",), "any", False),
     # --- евро, фунт, рубль
