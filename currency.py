@@ -315,8 +315,9 @@ for _token in sorted({t for t, _ in MARKERS}):
         _DIGIT_MARKS.append((_token, _digits.start(), _digits.end()))
 _SWISS_TAIL = re.compile(r"^[.,]-{1,2}")      # «49.–», «49,-»: без копеек
 
-# Что стоит перед числом и делает его не ценой: номер, счётчик, код.
-_NOT_PRICE_BEFORE = re.compile(r"(?:#|№|No\.?|x|×|\*|v|V|ver\.?)\s?$")
+# Что стоит перед числом и делает его не ценой: номер, счётчик, код, знаменатель
+# («₹1,100.00 /100 g» — за сто граммов, а не сто рупий).
+_NOT_PRICE_BEFORE = re.compile(r"(?:#|№|No\.?|x|×|\*|v|V|ver\.?|/)\s?$")
 # Единицы после числа: у цены их не бывает.
 _UNITS_AFTER = re.compile(
     r"^\s?(?:%|°|x\b|×|/5|★|шт|pcs|pc\b|reviews?|ratings?|отзыв|оцен|sold|продан|"
@@ -958,6 +959,27 @@ def _raised_tail(gray, box):
     return x0 + tail[-1][0]
 
 
+def _read_digits(gray, box, seps=False):
+    """Прочитать цифры в рамке отдельно, одними цифрами: '1' или None.
+
+    `seps` — с разделителями разрядов и копеек: '1,100.00'. Слева и справа
+    не прихватываем ни пикселя: там вплотную знак, и его край читался бы
+    лишней цифрой.
+    """
+    x0, y0, x1, y1 = box
+    m = max(3, (y1 - y0) // 4)
+    crop = gray.crop((x0, max(0, y0 - m), x1, min(gray.height, y1 + m)))
+    crop = ImageOps.expand(crop, border=12, fill=0 if _is_dark(crop) else 255)
+    allowed = "0123456789" + (".,'" if seps else "")
+    try:
+        got = pytesseract.image_to_string(
+            crop, config=f"--oem 3 --psm 7 -c tessedit_char_whitelist={allowed}")
+    except Exception:
+        return None
+    got = got.strip()
+    return got if re.fullmatch(r"\d[\d.,']*" if seps else r"\d+", got) else None
+
+
 def _read_cents(gray, x_from, box):
     """Прочитать висящие копейки отдельно, одними цифрами. '99' или None."""
     x0, y0, x1, y1 = box
@@ -1154,16 +1176,14 @@ def _sign_templates():
         return _signs
 
 
-def _classify_glyph(gray, box, dtop, dbottom):
-    """Знак на картинке -> (лучший знак валюты, запас над лучшей другой догадкой).
+def _distances(gray, box, dtop, dbottom):
+    """Знак на картинке -> [(расстояние, редкий ли, символ)] до каждого образца.
 
     Сравниваем разом со всеми образцами: образцы лежат одной сеткой, знак
     размножается такой же сеткой, и разница по клеткам считается одним
     уменьшением картинки — на две тысячи образцов уходит пара миллисекунд.
     """
     t = _sign_templates()
-    if not t["chars"]:
-        return None, 0.0
     tile, geo = _glyph_features(gray, box, dtop, dbottom)
     g = t["grid"]
     row = Image.new("L", (g * _TILE, _TILE))
@@ -1175,11 +1195,25 @@ def _classify_glyph(gray, box, dtop, dbottom):
     means = ImageChops.difference(t["sheet"], query).resize((g, g), Image.BOX).getdata()
     w0, w1, w2, w3 = _GEO_WEIGHTS
     q0, q1, q2, q3 = geo
+    return [(m / 255 + w0 * abs(a0 - q0) + w1 * abs(a1 - q1) + w2 * abs(a2 - q2)
+             + w3 * abs(a3 - q3), rare, ch)
+            for m, rare, ch, (a0, a1, a2, a3) in zip(means, t["rare"], t["chars"], t["geos"])]
+
+
+def _digit_guess(gray, box, dtop, dbottom):
+    """На какую цифру кусок похож больше всего — по тем же образцам."""
+    return min((d, ch) for d, _, ch in _distances(gray, box, dtop, dbottom)
+               if ch.isdigit())[1]
+
+
+def _classify_glyph(gray, box, dtop, dbottom):
+    """Знак на картинке -> (лучший знак валюты, запас над лучшей другой догадкой)."""
+    t = _sign_templates()
+    if not t["chars"]:
+        return None, 0.0
     best = {}
     best_rival = 9.0
-    for m, rare, ch, (a0, a1, a2, a3) in zip(means, t["rare"], t["chars"], t["geos"]):
-        d = m / 255 + w0 * abs(a0 - q0) + w1 * abs(a1 - q1) + w2 * abs(a2 - q2) \
-            + w3 * abs(a3 - q3)
+    for d, rare, ch in _distances(gray, box, dtop, dbottom):
         if rare:
             if d < best.get(ch, 9.0):
                 best[ch] = d
@@ -1258,16 +1292,23 @@ def _union(a, b):
     return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
 
 
-def _edge_sign(clean, glyph, tall, side, dtop, dbottom):
-    """Крайний знак у числа -> редкий знак или None; `tall` — куски самого числа.
+def _edge_sign(clean, glyph, tall, side, dtop, dbottom, floor=_SIGN_MARGIN):
+    """Крайний знак у числа -> (редкий знак или None, запас); `tall` — куски числа.
 
+    Знак берём, если запас над лучшей другой догадкой не меньше `floor`.
     Спорно, если крайний кусок вместе с соседним тоже похож на знак: так бывает,
     когда знак распался надвое и половину распознавание прочло цифрой — «45₪»
     читалось «451m», и выходило 451 шекель. Неверная сумма хуже никакой.
     """
+    dh = dbottom - dtop
+    if glyph[3] - glyph[1] < 0.75 * dh and glyph[1] < dtop + 0.2 * dh \
+            and glyph[3] < dbottom - 0.25 * dh:
+        # Знак мелко сверху, как копейки: «₹132⁰⁰» на Amazon. В росте цифр он
+        # для образцов слишком мал и высоко — сверяем в его собственном росте.
+        dtop, dbottom = glyph[1], glyph[3]
     sign, margin = _classify_glyph(clean, glyph, dtop, dbottom)
-    if not sign or margin < _SIGN_MARGIN:
-        return None
+    if not sign or margin < floor:
+        return None, margin
     # Следующий кусок внутрь — среди тех, что со знаком не пересекаются: рамка
     # слова у Tesseract бывает шире и накрывает сам знак. Половинки одного
     # знака стоят вплотную; через пробел — это уже соседи.
@@ -1275,12 +1316,41 @@ def _edge_sign(clean, glyph, tall, side, dtop, dbottom):
         inner = next((g for g in tall if g[0] >= glyph[2]), None)
     else:
         inner = next((g for g in reversed(tall) if g[2] <= glyph[0]), None)
-    if inner and max(glyph[0] - inner[2], inner[0] - glyph[2]) < 0.2 * (dbottom - dtop):
+    if inner and max(glyph[0] - inner[2], inner[0] - glyph[2]) < 0.2 * dh:
         # похоже на знак — даже если неясно, на какой из двух
-        _, margin = _classify_glyph(clean, _union(glyph, inner), dtop, dbottom)
-        if margin >= _SIGN_MARGIN:
-            return None
-    return sign
+        _, both = _classify_glyph(clean, _union(glyph, inner), dtop, dbottom)
+        if both >= _SIGN_MARGIN:
+            return None, margin
+    return sign, margin
+
+
+def _recheck_digits(clean, text, pieces, side, dtop, dbottom):
+    """Цифры числа, у которого узнан знак, — перепроверить без знака: текст или None.
+
+    Незнакомый знак вплотную сбивает распознавание и соседней цифры: в Arial
+    «₹132» читалось «<432», «(₹1,100.00» — «(4,100.00». Цифру у знака сверяем
+    с образцами цифр (сотая доля секунды); сошлось — верим. Нет — перечитываем
+    цифры в рост (без мелких копеек сверху) одними цифрами: четверть секунды,
+    поэтому только тогда. Цифр столько же — берём новые на те же места; иначе
+    None: неверная сумма хуже никакой. `pieces` — куски числа без знака.
+    """
+    dh = dbottom - dtop
+    full = [g for g in pieces if g[3] - g[1] >= 0.5 * dh and g[3] >= dbottom - 0.3 * dh]
+    places = [i for i, ch in enumerate(text) if ch.isdigit()][:len(full)]
+    if not full or len(places) != len(full):
+        return None
+    k = 0 if side == "pre" else -1
+    if _digit_guess(clean, full[k], dtop, dbottom) == text[places[k]]:
+        return text
+    got = _read_digits(clean, (full[0][0], min(g[1] for g in full),
+                               full[-1][2], max(g[3] for g in full)), seps=True)
+    got = re.sub(r"\D", "", got or "")
+    if len(got) != len(full):
+        return None
+    chars = list(text)
+    for i, d in zip(places, got):
+        chars[i] = d
+    return "".join(chars)
 
 
 def _find_rare_signs(rows, clean, scale):
@@ -1295,6 +1365,8 @@ def _find_rare_signs(rows, clean, scale):
     тоже сверяем: «₫1 299» читалось как «$1 299», и выходили доллары.
     """
     budget = 40                     # сверок на снимок (по ~10 мс) — хватит и на прайс
+    sure = set()                    # знаки, узнанные на снимке уверенно
+    weak = []                       # (слово, было, станет, знак) — если знак есть в sure
     for key, row in rows.items():
         row.sort(key=lambda wb: wb[1][0])
         boxes = [b for _, b in row]
@@ -1313,6 +1385,20 @@ def _find_rare_signs(rows, clean, scale):
                 continue
             dtop, dbottom = band
             dh = max(1, dbottom - dtop)
+            # Скобки по краям слова — «(₹1,100.00» — не знак и не цифра: снимаем
+            # их вместе с их кусками. Иначе сверялась скобка, а до «₹»,
+            # прочитанного цифрой «2», дело не доходило — выходило 21 100 рупий.
+            lead = re.match(r"[(\[{]*", text).group()
+            trail = re.search(r"[)\]}]*$", text).group()
+            if lead or trail:
+                ends = blobs[:len(lead)] + blobs[len(blobs) - len(trail):len(blobs)]
+                if len(blobs) > len(lead) + len(trail) and all(
+                        g[2] - g[0] <= 0.5 * dh and g[3] - g[1] >= 0.9 * dh for g in ends):
+                    blobs = blobs[len(lead):len(blobs) - len(trail)]
+                    wd["text"] = text[len(lead):len(text) - len(trail)]
+                else:
+                    # на картинке не скобка: «45₪» читалось «45m)» — это знак
+                    lead = trail = ""
             tall = [g for g in blobs if g[3] - g[1] >= 0.3 * dh]
 
             def around(side):
@@ -1321,7 +1407,7 @@ def _find_rare_signs(rows, clean, scale):
                 digits = [i for i, ch in enumerate(text) if ch.isdigit()]
                 edge = text[:digits[0]] if side == "pre" else text[digits[-1] + 1:]
                 near = k - 1 if side == "pre" else k + 1
-                if edge or not 0 <= near < len(row):
+                if edge or not 0 <= near < len(row) or (lead if side == "pre" else trail):
                     return edge, None
                 nwd, nb = row[near]
                 gap = b[0] - nb[2] if side == "pre" else nb[0] - b[2]
@@ -1355,9 +1441,29 @@ def _find_rare_signs(rows, clean, scale):
                             if g[0] < glyph[2] and glyph[0] < g[2]:
                                 glyph = _union(glyph, g)
                         budget -= 2
-                        sign = _edge_sign(clean, glyph, tall, side, dtop, dbottom)
+                        sign, _ = _edge_sign(clean, glyph, tall, side, dtop, dbottom)
                         if sign:
                             nwd["text"] = sign
+                            sure.add(sign)
+                    elif side == "pre" and len(nwd["text"]) <= 3 and 2 <= len(nblobs) <= 3 \
+                            and not re.search(r"\d", nwd["text"]) and tall \
+                            and all(g[3] - g[1] >= 0.8 * dh and abs(g[3] - dbottom) <= 0.15 * dh
+                                    for g in nblobs[1:]):
+                        # Знак и слипшиеся с ним цифры: «₹1» прочитано «=»,
+                        # «₫1» — «di», «฿1» — «Bi». Цифры после знака дочитываем
+                        # отдельно, одними цифрами; кусков должно выйти столько же.
+                        rest = nblobs[1:]
+                        budget -= 2
+                        sign, _ = _edge_sign(clean, nblobs[0], rest + tall, side, dtop, dbottom)
+                        got = sign and _read_digits(clean, (rest[0][0], min(g[1] for g in rest),
+                                                            rest[-1][2], max(g[3] for g in rest)))
+                        if got and len(got) == len(rest):
+                            if tall[0][0] - rest[-1][2] <= 0.35 * dh:
+                                # вплотную к числу — это его начало: «₹132», а не «₹1 32»
+                                nwd["text"], wd["text"] = sign, got + wd["text"]
+                            else:
+                                nwd["text"] = sign + got         # «₫1 299»
+                            sure.add(sign)
                     continue
                 if len(edge) > 2:
                     continue
@@ -1365,27 +1471,42 @@ def _find_rare_signs(rows, clean, scale):
                 if len(tall) >= 2:
                     glyph = tall[0] if side == "pre" else tall[-1]
                     budget -= 2
-                    sign = _edge_sign(clean, glyph, tall, side, dtop, dbottom)
+                    sign, margin = _edge_sign(clean, glyph, tall, side, dtop, dbottom,
+                                              _SIGN_MARGIN if edge else 0.0)
                     if sign:
                         # Сколько знаков у числа без края — по картинке и по
                         # прочитанному. Не сходится — не трогаем: «45₪» читалось
                         # «451m», один знак двумя буквами, и замена «m» оставляла
-                        # 451 шекель. Точки и запятые мелкие, их не считаем.
+                        # 451 шекель. Точки и запятые мелкие, их не считаем, а
+                        # копейки мелко сверху («₹132⁰⁰») — считаем: висят над строкой.
                         text = wd["text"]
                         body = text[len(edge):] if side == "pre" else text[:len(text) - len(edge)]
-                        drawn = sum(1 for g in tall if g is not glyph and g[3] - g[1] >= 0.5 * dh)
+                        drawn = sum(1 for g in tall if g is not glyph and (
+                            g[3] - g[1] >= 0.5 * dh or g[3] < dbottom - 0.3 * dh))
                         read = len(_SIGNIFICANT.findall(body))
                         if edge and drawn == read:
                             text = sign + body if side == "pre" else body + sign
                         elif not edge and drawn == read - 1:    # знак прочитан цифрой: «1002»
                             text = sign + text[1:] if side == "pre" else text[:-1] + sign
-                        elif not edge and drawn == read:        # знак в рамке, но не прочитан
-                            text = sign + text if side == "pre" else text + sign
+                        elif not edge and drawn == read and margin >= _SIGN_MARGIN:
+                            text = sign + text if side == "pre" else text + sign   # не прочитан
                         else:
+                            text = None
+                        if text:
+                            text = _recheck_digits(clean, text, [g for g in tall if g is not glyph],
+                                                   side, dtop, dbottom)
+                        if text and margin < _SIGN_MARGIN:
+                            # Неуверенно, но цифры на этом месте тоже не видно:
+                            # мелкая «(₹1,100.00» читалась «(21,100.00». Меняем,
+                            # только если тот же знак нашёлся на снимке уверенно.
+                            weak.append((wd, lead + wd["text"] + trail, lead + text + trail, sign))
+                        elif text:
+                            wd["text"] = text
+                            sure.add(sign)
                             continue
-                        wd["text"] = text
-                        continue
-                if edge:
+                        if margin >= _SIGN_MARGIN:
+                            continue
+                if edge or (lead if side == "pre" else trail):
                     continue
                 # чернила за рамкой слова, которые распознавание не взяло вовсе
                 if side == "pre":
@@ -1402,9 +1523,10 @@ def _find_rare_signs(rows, clean, scale):
                 if gap > 1.0 * dh:
                     continue
                 budget -= 2
-                sign = _edge_sign(clean, glyph, tall, side, dtop, dbottom)
+                sign, _ = _edge_sign(clean, glyph, tall, side, dtop, dbottom)
                 if not sign:
                     continue
+                sure.add(sign)
                 if gap <= 0.35 * dh:
                     # вплотную к цифрам — часть того же слова: «₹100», а не «₹ 100»;
                     # от этого зависит, чей знак, когда чисел в строке два
@@ -1415,8 +1537,14 @@ def _find_rare_signs(rows, clean, scale):
                     additions.append(({"text": sign, "conf": 0, "strike": wd["strike"],
                                        "box": tuple(int(round(v / scale)) for v in glyph)},
                                       glyph))
+            wd["text"] = lead + wd["text"] + trail
         row.extend(additions)
         row.sort(key=lambda wb: wb[1][0])
+    # Цифр, похожих на знак, среди тысяч проверенных не нашлось ни одной даже
+    # с таким запасом, так что рядом с тем же знаком неуверенному верим
+    for wd, was, now, sign in weak:
+        if sign in sure and wd["text"] == was:
+            wd["text"] = now
 
 
 def read_lines(img, langs="eng", scale=2.0):
