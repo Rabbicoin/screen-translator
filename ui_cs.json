@@ -124,6 +124,7 @@
  "cur_none": "Nebyly nalezeny žádné ceny se znakem měny.\nPokud není žádný znak nebo to vypadá nezvykle, vyberte měnu pomocí tlačítka «obrazovka měny» níže.",
  "cur_offline": "Nelze získat směnné kurzy: není připojení k internetu.",
  "cur_stale": "Nové sazby nelze stáhnout – byly použity uložené.",
+ "cur_disclaimer": "Částky jsou rozpoznány ze snímku automaticky a mohou být nepřesné – porovnejte je s cenou na obrazovce. Kurz je orientační.",
  "mode_list": "Jako seznam",
  "cur_old": "stará cena",
  "cur_picked": "měnu, jak jste si vybrali",

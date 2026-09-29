@@ -42,6 +42,13 @@ press your own keys.
 **[Download for Windows](https://github.com/Rabbicoin/screen-translator/releases/latest)**
 · [Website with a video](https://sevdev.ru/en/apps/screen-translator)
 
+**No warranty.** The program is provided "as is" (GPL-3.0, sections 15–16).
+Translation is done by a machine service, and text and prices are recognised
+automatically, so mistakes happen: missed or wrong words, misread amounts and
+currencies. Exchange rates come from public sources and are for reference only.
+Check anything important against the original — the author is not liable for
+losses arising from the use of the program.
+
 The rest of this document is in Russian — it is the full manual, from the
 config file to how the overlay is rendered.
 
@@ -836,6 +843,17 @@ python screen_translator.py
 Отдельно ставится [Tesseract OCR](https://github.com/UB-Mannheim/tesseract/wiki) — это не библиотека Python.
 Настройки берутся из `config.json`; образец со всеми полями — `config.example.json`,
 свой словарь замен — `glossary.example.json`. Оба личные файлы в репозиторий не попадают.
+
+## Отказ от ответственности
+
+Программа бесплатная и распространяется «как есть», без каких-либо гарантий
+(лицензия GPL-3.0, разделы 15–16). Перевод делает машинный сервис, а текст и цены
+распознаются автоматически, поэтому возможны ошибки: пропущенные или неверные
+слова, неверно прочитанные суммы и валюты. Курсы валют берутся из открытых
+источников (ЦБ РФ, currency-api) и носят справочный характер. Не принимайте на
+основе результатов программы решений, где ошибка может стоить денег, здоровья или
+юридических последствий, — сверяйтесь с оригиналом. Автор не несёт
+ответственности за убытки, связанные с использованием программы.
 
 ## Лицензия
 

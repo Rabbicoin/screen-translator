@@ -72,6 +72,7 @@
  "cur_none": "Es wurden keine Preise mit Währungszeichen gefunden.\nWenn kein Zeichen vorhanden ist oder es ungewöhnlich aussieht, wählen Sie die Währung mit der Schaltfläche „Bildschirmwährung“ unten aus.",
  "cur_offline": "Wechselkurse konnten nicht abgerufen werden: keine Internetverbindung.",
  "cur_stale": "Aktuelle Tarife konnten nicht heruntergeladen werden – gespeicherte Tarife wurden verwendet.",
+ "cur_disclaimer": "Beträge werden automatisch vom Bildschirm erkannt und können ungenau sein – vergleichen Sie sie mit dem Preis auf dem Bildschirm. Der Kurs dient nur zur Orientierung.",
  "mode_list": "Als Liste",
  "cur_old": "Alter Preis",
  "cur_picked": "Währung, wie Sie ausgewählt haben",

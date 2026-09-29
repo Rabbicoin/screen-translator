@@ -72,6 +72,7 @@
  "cur_none": "No se encontraron precios con signo de moneda.\nSi no hay ningún signo o parece inusual, elija la moneda con el botón \"moneda de pantalla\" a continuación.",
  "cur_offline": "No se pudieron obtener los tipos de cambio: no hay conexión a Internet.",
  "cur_stale": "No se pudieron descargar tarifas actualizadas; se utilizaron las guardadas.",
+ "cur_disclaimer": "Los importes se reconocen automáticamente en la captura y pueden ser inexactos: compárelos con el precio en pantalla. El tipo de cambio es solo orientativo.",
  "mode_list": "como una lista",
  "cur_old": "precio antiguo",
  "cur_picked": "moneda que elegiste",

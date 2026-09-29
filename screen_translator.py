@@ -861,6 +861,10 @@ UI_STRINGS = {
                       "Could not get exchange rates: no internet connection."),
     "cur_stale":     ("Свежие курсы не скачались — посчитано по сохранённым.",
                       "Fresh rates could not be downloaded — saved ones were used."),
+    "cur_disclaimer": ("Суммы распознаны со снимка автоматически и могут быть неточны — "
+                       "сверяйте с ценой на экране. Курс справочный.",
+                       "Amounts are read from the screen automatically and may be wrong — "
+                       "check them against the original. Rates are for reference only."),
     "mode_list":     ("Списком", "As a list"),
     "cur_old":       ("старая цена", "old price"),
     "cur_picked":    ("валюта по вашему выбору", "currency as you picked"),
@@ -3690,11 +3694,15 @@ class ResultWindow:
             # а строка о валюте и курсы — пояснения к ним. Пометки вроде
             # «(старая цена)» остаются обычными.
             text.tag_configure("strong", font=("Segoe UI", fs, "bold"))
+            # предупреждение о возможных ошибках — мелко и серым: оговорка, а не результат
+            text.tag_configure("note", foreground=c["dim"], font=("Segoe UI", max(8, fs - 2)))
             if self.prices is not None and self.text_kind == "trans":
                 for n, line in enumerate((body or "").split("\n"), 1):
                     part = next((s for s in self.prices.strong if line.startswith(s)), None)
                     if part:
                         text.tag_add("strong", f"{n}.0", f"{n}.{len(part)}")
+                    elif line == tr("cur_disclaimer"):
+                        text.tag_add("note", f"{n}.0", f"{n}.end")
             self._make_readonly(text)
             self.text_widget = text
             # колесо здесь листает текст, поэтому кегль — на Ctrl+колесо
@@ -3837,7 +3845,7 @@ class ResultWindow:
                 if note:
                     label = tk.Label(bar, text=note, bg=c["bar"], fg=c["faint"],
                                      font=("Segoe UI", 8), padx=6, pady=6)
-                    Tooltip(label, self.prices.note_long())
+                    Tooltip(label, self.prices.note_long() + "\n\n" + tr("cur_disclaimer"))
                     groups.append([label])
 
         # ползунок крупности: в тексте — кегль шрифта, в картинке — масштаб оверлея.
@@ -4402,6 +4410,7 @@ class ResultWindow:
             fs = self._font_size()
             self.text_widget.configure(font=("Segoe UI", fs))
             self.text_widget.tag_configure("strong", font=("Segoe UI", fs, "bold"))
+            self.text_widget.tag_configure("note", font=("Segoe UI", max(8, fs - 2)))
             return
 
         shown = self._display_image()
@@ -4788,7 +4797,7 @@ class PriceSnapshot:
         if not prices:
             return tr("cur_none"), None
         text = (f'{tr("cur_seen")}: {self.seen_title()}\n\n' + "\n".join(rows)
-                + "\n\n" + self.note_long())
+                + "\n\n" + self.note_long() + "\n\n" + tr("cur_disclaimer"))
         min_font = int(_clamp(CFG.get("overlay_min_font", 8), 6, 40, 8))
 
         def draw(zoom, prices=prices, labels=labels):
