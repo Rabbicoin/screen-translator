@@ -5720,6 +5720,17 @@ def selftest():
             raise RuntimeError(f"разобралось {got} вместо {want}")
         return " · ".join(samples) + " — верно"
 
+    def check_signs():
+        """Редкий знак с картинки: Tesseract его не знает, узнаёт сверка с образцами
+        из шрифтов Windows — её и проверяем, со снимком и распознаванием."""
+        img = Image.new("RGB", (260, 70), "white")
+        font = ImageFont.truetype(os.path.join(currency.FONTS_DIR, "segoeui.ttf"), 34)
+        ImageDraw.Draw(img).text((14, 10), "100 ₴", font=font, fill="black")
+        got = [(p.amount, p.code) for p in currency.find_prices(currency.read_lines(img, "eng"))]
+        if got != [(100.0, "UAH")]:
+            raise RuntimeError(f"«100 ₴» разобралось как {got}")
+        return "«100 ₴» → 100 UAH"
+
     def check_rates():
         rates = currency.load_rates(RATES_PATH, log=log)
         return (f"ЦБ на {rates.cbr_date or '—'}, запасной на {_dmy(rates.fb_date) or '—'}, "
@@ -5762,6 +5773,7 @@ def selftest():
     step("Распознавание текста", check_ocr)
     step("Перевод через интернет", check_translate)
     step("Разбор цен", check_prices)
+    step("Редкие знаки валют", check_signs)
     step("Курсы валют", check_rates)
     step("Окно и иконка в трее", check_gui)
 
