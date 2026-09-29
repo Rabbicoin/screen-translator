@@ -8,6 +8,7 @@
 import math
 import os
 import pickle
+import re
 import sys
 
 ARGS = sys.argv[1:]
@@ -58,7 +59,12 @@ def collect():
                     sign, rest = blobs[-1], blobs[:-1]
                 else:
                     continue
-                band = currency._digit_band(rest[-4:] if stripped.endswith(ch) else rest[:4])
+                # высота цифр — только по цифрам у знака: в «Цена: 45₮» буквы
+                # «на:» ниже цифр и сбивали бы её
+                digits = re.search(r"\d+$" if stripped.endswith(ch) else r"^\d+",
+                                   stripped.replace(ch, ""))
+                n = min(4, len(digits.group())) if digits else 4
+                band = currency._digit_band(rest[-n:] if stripped.endswith(ch) else rest[:n])
                 if band:
                     pos.append((name, text, ch, clean, sign, band))
             elif group in ("NP", "S4", "S2", "S1", "S3"):

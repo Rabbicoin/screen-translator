@@ -163,6 +163,14 @@ CASES = [
     # код слитно, копейки сверху, без знака, криптовалюта
     ("USD50", "", "auto", [(50, "USD", False)]),
     ("50EUR", "", "auto", [(50, "EUR", False)]),
+    # Amazon: «₹» и копейки мелко сверху, рядом цена за 100 г. Распознавание
+    # читало «₹1» как «=» и теряло единицу (32 вместо 132), мелкий «₹» в
+    # скобках — цифрой «2» (21 100 вместо 1 100), а «/100» считало ценой.
+    ("₹132.00 (₹1,100.00 /100 g)", "file:inr_amazon.png:eng", "auto",
+     [(132, "INR", False), (1100, "INR", False)]),
+    ("₹132.00 (₹1,100.00 /100 g)", "file:inr_amazon.png:eng+rus", "INR",
+     [(132, "INR", False), (1100, "INR", False)]),
+    ("₹|132|00|(₹1,100.00 /100 g)", "amazon", "auto", [(132, "INR", False), (1100, "INR", False)]),
     ("$19|99", "sup", "auto", [(19.99, "USD", False)]),
     # Франция: знак на месте запятой, копейки мелко сверху — «19€⁹⁹»
     ("19€|99", "sup", "auto", [(19.99, "EUR", False)]),
@@ -244,10 +252,23 @@ def draw_case(text, style):
     """Цена картинкой: белый фон, шрифт сайта, как её выделили бы мышью."""
     if style.startswith(("web:", "dark:")):
         return draw_web(text, style)
+    if style.startswith("file:"):
+        return Image.open(os.path.join(HERE, "images", style.split(":")[1])).convert("RGB")
     pad, ink = 10, (32, 33, 36)
     img = Image.new("RGB", (600, 80), "white")
     d = ImageDraw.Draw(img)
-    if style == "sup":
+    if style == "amazon":
+        # знак и копейки мелко сверху, за ценой мелко — цена за единицу
+        sign, whole, cents, unit = text.split("|")
+        arial = os.path.join(FONTS, "arial.ttf")
+        f_big, f_sup, f_unit = (ImageFont.truetype(arial, s) for s in (34, 15, 12))
+        x = pad
+        for part, font, dy, gap in ((sign, f_sup, 2, 1), (whole, f_big, 0, 1),
+                                    (cents, f_sup, 2, 8), (unit, f_unit, 17, 0)):
+            d.text((x, pad + dy), part, font=font, fill=ink)
+            x += d.textlength(part, font=font) + gap
+        right, bottom = x, pad + 42
+    elif style == "sup":
         main, cents = text.split("|")
         f1, f2 = _font(main, 30, True), _font(cents, 16, True)
         d.text((pad, pad), main, font=f1, fill=ink)
@@ -280,6 +301,8 @@ def main():
     for text, style, source, want in CASES:
         img = draw_case(text, style)
         langs = "eng+chi_sim" if any(ord(c) > 0x2E80 for c in text) else "eng+rus"
+        if style.count(":") == 2 and style.startswith("file:"):
+            langs = style.split(":")[2]        # «file:снимок.png:eng» — языки как у снимка
         lines = currency.read_lines(img, langs)
         box = any(len(w) > 3 for w in want)
         got = [(round(p.amount, 6), p.code, p.strike) + ((p.text.translate(_TWINS),) if box else ())
