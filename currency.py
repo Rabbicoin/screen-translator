@@ -381,6 +381,11 @@ def _numbers(text):
         if not m:
             return
         start, end = m.span()
+        # Пробел делит разряды, только если перед ним не больше трёх цифр:
+        # «1299 999 ₽» — старая цена и новая, а не 1 299 999
+        head = re.match(r"\d+", text[start:end]).end()
+        if head > 3 and text[start + head:start + head + 1] == " ":
+            end = start + head
         for token, d0, d1 in _DIGIT_MARKS:
             at = start - d0
             # метка стоит отдельно, как в _marker_before: «copy6» — не «py6»
@@ -436,6 +441,10 @@ def _multiplier_after(text, pos):
         if right.startswith(token):
             nxt = right[len(token):len(token) + 1]
             if token[-1].isalpha() and nxt.isalpha():
+                continue
+            # «₹1,499 M.R.P.: ₹2,999»: «M.» с буквой за точкой — сокращение, а не
+            # миллионы; выходило полтора миллиарда рупий
+            if token[-1].isalpha() and re.match(r"\.[^\W\d_]", right[len(token):]):
                 continue
             return k, pos + skip + len(token)
     return None
@@ -680,6 +689,9 @@ def find_prices(lines, source="auto"):
 
         for it in items:
             if not it["code"] or it["value"] <= 0:
+                continue
+            # зачёркнутая цена, цифры которой с картинкой не сошлись (_check_struck)
+            if any(w.get("doubt") for s, e, w in spans if s < it["end"] and it["start"] < e):
                 continue
             span0, span1 = it["span"]
             box, strike, digits_x = _span_box(line, spans, span0, span1)
@@ -1184,33 +1196,58 @@ def _sign_templates():
         return _signs
 
 
-def _distances(gray, box, dtop, dbottom):
+def _tiled(tile, grid):
+    """Клетка _TILE×_TILE, размноженная сеткой grid×grid."""
+    row = Image.new("L", (grid * _TILE, _TILE))
+    for c in range(grid):
+        row.paste(tile, (c * _TILE, 0))
+    sheet = Image.new("L", (grid * _TILE, grid * _TILE))
+    for r in range(grid):
+        sheet.paste(row, (0, r * _TILE))
+    return sheet
+
+
+def _distances(gray, box, dtop, dbottom, skip=None):
     """Знак на картинке -> [(расстояние, редкий ли, символ)] до каждого образца.
 
     Сравниваем разом со всеми образцами: образцы лежат одной сеткой, знак
     размножается такой же сеткой, и разница по клеткам считается одним
     уменьшением картинки — на две тысячи образцов уходит пара миллисекунд.
+
+    `skip` — строки картинки (y0, y1), которые не сравниваем: там прошла линия
+    зачёркивания, и от неё остались обрывки. Зачёркнутая «1» с ними похожа на
+    «4»; без этих строк — снова на «1».
     """
     t = _sign_templates()
     tile, geo = _glyph_features(gray, box, dtop, dbottom)
     g = t["grid"]
-    row = Image.new("L", (g * _TILE, _TILE))
-    for c in range(g):
-        row.paste(tile, (c * _TILE, 0))
-    query = Image.new("L", (g * _TILE, g * _TILE))
-    for r in range(g):
-        query.paste(row, (0, r * _TILE))
-    means = ImageChops.difference(t["sheet"], query).resize((g, g), Image.BOX).getdata()
+    diff = ImageChops.difference(t["sheet"], _tiled(tile, g))
+    gain = 1.0
+    if skip:
+        w, h = box[2] - box[0], box[3] - box[1]
+        side = max(w, h)
+        top = box[1] - (side - h) // 2              # где клетка начинается на картинке
+        r0 = max(0, (skip[0] - top) * _TILE // side)
+        r1 = min(_TILE, -(-(skip[1] + 1 - top) * _TILE // side))
+        if 0 < r1 - r0 < _TILE:
+            masks = t.setdefault("masks", {})
+            if (r0, r1) not in masks:
+                cell = Image.new("L", (_TILE, _TILE), 255)
+                cell.paste(0, (0, r0, _TILE, r1))
+                masks[(r0, r1)] = _tiled(cell, g)
+            diff = ImageChops.multiply(diff, masks[(r0, r1)])
+            gain = _TILE / (_TILE - (r1 - r0))      # строк меньше — разница на строку та же
+    means = diff.resize((g, g), Image.BOX).getdata()
     w0, w1, w2, w3 = _GEO_WEIGHTS
     q0, q1, q2, q3 = geo
-    return [(m / 255 + w0 * abs(a0 - q0) + w1 * abs(a1 - q1) + w2 * abs(a2 - q2)
+    return [(m / 255 * gain + w0 * abs(a0 - q0) + w1 * abs(a1 - q1) + w2 * abs(a2 - q2)
              + w3 * abs(a3 - q3), rare, ch)
             for m, rare, ch, (a0, a1, a2, a3) in zip(means, t["rare"], t["chars"], t["geos"])]
 
 
-def _digit_guess(gray, box, dtop, dbottom):
+def _digit_guess(gray, box, dtop, dbottom, skip=None):
     """На какую цифру кусок похож больше всего — по тем же образцам."""
-    return min((d, ch) for d, _, ch in _distances(gray, box, dtop, dbottom)
+    return min((d, ch) for d, _, ch in _distances(gray, box, dtop, dbottom, skip)
                if ch.isdigit())[1]
 
 
@@ -1348,6 +1385,17 @@ def _edge_sign(clean, glyph, tall, side, dtop, dbottom, floor=_SIGN_MARGIN):
     return sign, margin
 
 
+def _full_height(pieces, dtop, dbottom):
+    """Куски в рост цифры: без точек, запятых и мелких копеек сверху.
+
+    Запятая в Georgia и Trebuchet вдвое выше обычной и сходила за цифру:
+    «₹3,999» выходило «₹33,999». Отличаем по верху — он у неё ниже середины.
+    """
+    dh = dbottom - dtop
+    return [g for g in pieces if g[3] - g[1] >= 0.5 * dh and g[3] >= dbottom - 0.3 * dh
+            and g[1] < dtop + 0.4 * dh]
+
+
 def _recheck_digits(clean, text, pieces, side, dtop, dbottom):
     """Цифры числа, у которого узнан знак, — перепроверить без знака: текст или None.
 
@@ -1357,10 +1405,18 @@ def _recheck_digits(clean, text, pieces, side, dtop, dbottom):
     цифры в рост (без мелких копеек сверху) одними цифрами: четверть секунды,
     поэтому только тогда. Цифр столько же — берём новые на те же места; иначе
     None: неверная сумма хуже никакой. `pieces` — куски числа без знака.
+
+    За числом в том же слове бывают буквы — «(₹440/kg)» читается слитно. Их
+    куски тоже в рост, но к цифрам не относятся: после знака берём столько
+    кусков, сколько цифр в числе сразу за ним.
     """
-    dh = dbottom - dtop
-    full = [g for g in pieces if g[3] - g[1] >= 0.5 * dh and g[3] >= dbottom - 0.3 * dh]
-    places = [i for i, ch in enumerate(text) if ch.isdigit()][:len(full)]
+    full = _full_height(pieces, dtop, dbottom)
+    places = [i for i, ch in enumerate(text) if ch.isdigit()]
+    if side == "pre":
+        run = re.match(r"\D*\d[\d.,']*", text)
+        places = [i for i in places if i < run.end()] if run else []
+        full = full[:len(places)]
+    places = places[:len(full)]
     if not full or len(places) != len(full):
         return None
     k = 0 if side == "pre" else -1
@@ -1546,8 +1602,11 @@ def _find_rare_signs(rows, clean, scale, langs="eng"):
                     budget -= 2
                     sign, margin = _edge_sign(clean, first, run, "pre", dtop, dbottom, 0.0)
                 strong = sign and margin >= _SIGN_MARGIN
+                mark = sign if strong else edge if edge and _any_mark(edge, "pre") else ""
                 number = None
-                if run[-1][2] > b[2] + 0.2 * dh or re.search(r"[^\W\d_]", body) \
+                if not (mark or sign):
+                    pass        # не знак: в Georgia «1» и «2» мельче и выше соседних цифр
+                elif run[-1][2] > b[2] + 0.2 * dh or re.search(r"[^\W\d_]", body) \
                         or len(digits) not in (len(run), len(run) + len(tail)) \
                         or len(re.findall(r"\d[.,'](?=\d)", body)) > seps + with_cents \
                         or _digit_guess(clean, run[0], dtop, dbottom) != digits[0]:
@@ -1556,13 +1615,14 @@ def _find_rare_signs(rows, clean, scale, langs="eng"):
                         number = _number_at_sign(clean, run, tail, seps, dtop, dbottom, langs)
                 elif strong:
                     number = body
+                if number and not mark:
+                    # знак узнан неуверенно — число без него не трогаем, а правим,
+                    # только если тот же знак найдётся на снимке уверенно
+                    weak.append((wd, text, sign + number, sign))
+                    number = None
                 if number:
-                    mark = edge if edge and _any_mark(edge, "pre") else ""
                     if strong:
-                        mark = sign
                         sure.add(sign)
-                    elif sign and not mark:
-                        weak.append((wd, number, sign + number, sign))
                     wd["text"] = mark + number
                     # куски той же цены, прочитанные отдельными словами, — в неё
                     end = (tail or run)[-1][2]
@@ -1687,8 +1747,11 @@ def _find_rare_signs(rows, clean, scale, langs="eng"):
                         # копейки мелко сверху («₹132⁰⁰») — считаем: висят над строкой.
                         text = wd["text"]
                         body = text[len(edge):] if side == "pre" else text[:len(text) - len(edge)]
-                        drawn = sum(1 for g in tall if g is not glyph and (
-                            g[3] - g[1] >= 0.5 * dh or g[3] < dbottom - 0.3 * dh))
+                        # слипшиеся цифры («00» в Georgia) — один кусок, а знака два;
+                        # жирная «4» в Tahoma шириной с рост цифры, пара — от полутора
+                        drawn = sum(2 if g[2] - g[0] >= 1.3 * dh else 1
+                                    for g in tall if g is not glyph and g[1] < dtop + 0.4 * dh
+                                    and (g[3] - g[1] >= 0.5 * dh or g[3] < dbottom - 0.3 * dh))
                         read = len(_SIGNIFICANT.findall(body))
                         as_digit = not edge and drawn == read - 1
                         if edge and drawn == read:
@@ -1753,6 +1816,112 @@ def _find_rare_signs(rows, clean, scale, langs="eng"):
     for wd, was, now, sign in weak:
         if sign in sure and wd["text"] == was:
             wd["text"] = now
+    return sure
+
+
+# Знак из окружения берём, если кусок похож на него не меньше, чем на ближайшую
+# цифру, на то, чем он прочитан, и на лучший из редких знаков, — с такими
+# допусками. И с какого расстояния до образцов цифр кусок — уже не цифра: у
+# зачёркнутых цифр оно 0,03–0,11, у знаков от 0,16.
+_STRUCK_NEAR = (0.01, 0.03, 0.035)
+_STRUCK_NOT_DIGIT = 0.15
+# Какие прочитанные цифры правим по образцам: линия дорисовывает «1» перекладину,
+# и выходит «4», а вместе с линией стирается середина «3», и выходит «2». В
+# остальных расхождениях не прав бывает и тот, и другой: шрифтами Windows
+# ошибаются образцы («7» -> «5»), мелким шрифтом Amazon — распознавание
+# («9» -> «8», «0», «2», перевес образцов от 0,036). Поэтому такую цену не
+# показываем вовсе — если только перевес образцов не мал: «9» и «0» без середины
+# они сами путают, с перевесом до 0,02.
+_STRUCK_SWAPS = {("4", "1"), ("2", "3")}
+_STRUCK_SWAP_MARGIN = 0.015
+_STRUCK_DOUBT_MARGIN = 0.03
+
+
+def _check_struck(rows, clean, strikes, sure):
+    """Зачёркнутые цены: знак валюты берём по окружению, цифры сверяем с образцами.
+
+    Линия зачёркивания портит и знак, и цифры. Знак после стирания линии на
+    себя почти не похож: «₹» шрифтом Amazon читается «3», «2», «$». Но на цифру
+    он не похож тоже, а какая здесь валюта, видно рядом — тот же знак узнан у
+    соседней цены или перед числом стоит «M.R.P.» (так старую цену подписывают
+    в Индии). Цифры: «1» с обрывками линии читается как «4», и «₹1,299»
+    выходило «₹4,299». Цифры сверяем с образцами, пропуская строки, где прошла
+    линия. Замеры — на стенде зачёркнутых цен (семь шрифтов, три масштаба):
+    где прочитанное и образцы совпали, ошибок не было ни одной. Где разошлись
+    всерьёз — слово помечаем `doubt`, и find_prices такую цену не берёт.
+    """
+    budget = 12                     # зачёркнутых слов на снимок, по ~20 мс
+    for row in rows.values():
+        row.sort(key=lambda wb: wb[1][0])
+        for k, (wd, b) in enumerate(row):
+            text = wd["text"]
+            if budget <= 0 or not wd["strike"] or not re.search(r"\d", text):
+                continue
+            line = next((s for s in strikes if b[1] < s[2] and s[3] < b[3]
+                         and min(s[1], b[2]) - max(s[0], b[0]) >= 0.6 * (b[2] - b[0])), None)
+            blobs = _own_blobs(clean, row, k)
+            band = _digit_band(blobs)
+            if not line or not band:
+                continue
+            budget -= 1
+            dtop, dbottom = band
+            dh = dbottom - dtop
+            skip = (line[2] - 1, line[3] + 1)       # линия и по строке каймы с каждой стороны
+            # Куски в рост и буквы слова — один к одному. Слипшаяся пара цифр
+            # («00» в конце) — один кусок на две буквы; его не сверяем.
+            pieces = []
+            for g in _full_height(blobs, dtop, dbottom):
+                pieces += [g] if g[2] - g[0] < 1.3 * dh else [None, None]
+            places = [i for i, ch in enumerate(text) if _SIGNIFICANT.match(ch)]
+            # обрывок линии за последней цифрой читается знаком препинания: «3549:»
+            while len(places) > len(pieces) and text[places[-1]] in ":;-–—_~":
+                places.pop()
+            unread = len(pieces) == len(places) + 1     # первый кусок не прочитан вовсе
+            if not pieces or not pieces[0] or not (unread or len(pieces) == len(places)):
+                continue
+            first = "" if unread else text[places[0]]
+            expected = set(sure)
+            if k and re.sub(r"[^A-Za-z]", "", row[k - 1][0]["text"]).upper() == "MRP":
+                expected.add("₹")
+            tail = text[max(i for i, ch in enumerate(text) if ch.isdigit()) + 1:]
+            after = tail or (row[k + 1][0]["text"] if k + 1 < len(row) else "")
+            if expected and not _any_mark(after, "post") and (
+                    unread or first.isdigit() or first in "€£¥"
+                    or first.translate(_LATIN_TWIN) in _UNSURE_MARKS):
+                ds = _distances(clean, pieces[0], dtop, dbottom, skip)
+                digit, guess = min((d, ch) for d, _, ch in ds if ch.isdigit())
+                claim = min((d for d, _, ch in ds if ch == first), default=9.0)
+                rare = min(d for d, is_rare, _ in ds if is_rare)
+                near, sign = min((min((d for d, _, ch in ds if ch == s), default=9.0), s)
+                                 for s in expected)
+                if guess != first and digit >= _STRUCK_NOT_DIGIT \
+                        and near <= min(digit + _STRUCK_NEAR[0], claim + _STRUCK_NEAR[1],
+                                        rare + _STRUCK_NEAR[2]):
+                    if unread:
+                        text = sign + text
+                        places = [i + 1 for i in places]
+                    else:
+                        text = text[:places[0]] + sign + text[places[0] + 1:]
+                        places = places[1:]
+                    pieces = pieces[1:]
+                    unread = False
+            if unread:
+                continue
+            chars = list(text)
+            for i, g in zip(places, pieces):
+                if not g or not chars[i].isdigit():
+                    continue
+                best = {}
+                for d, _, ch in _distances(clean, g, dtop, dbottom, skip):
+                    if ch.isdigit() and d < best.get(ch, 9.0):
+                        best[ch] = d
+                guess = min(best, key=best.get)
+                lead = best[chars[i]] - best[guess]
+                if (chars[i], guess) in _STRUCK_SWAPS and lead >= _STRUCK_SWAP_MARGIN:
+                    chars[i] = guess
+                elif lead >= _STRUCK_DOUBT_MARGIN:
+                    wd["doubt"] = True
+            wd["text"] = "".join(chars)
 
 
 def read_lines(img, langs="eng", scale=2.0):
@@ -1847,7 +2016,8 @@ def read_lines(img, langs="eng", scale=2.0):
         if now == was or (now == was[1:] and old[0].isdigit() and not again[0].isdigit()):
             wd["text"] = again
     _dollar_or_s(rows, clean)
-    _find_rare_signs(rows, clean, scale, langs)
+    sure = _find_rare_signs(rows, clean, scale, langs)
+    _check_struck(rows, clean, strikes, sure)
     lines = [sorted((wd for wd, _ in ws), key=lambda w: w["box"][0]) for ws in rows.values()]
     lines.sort(key=lambda ws: (min(w["box"][1] for w in ws), ws[0]["box"][0]))
     return lines
