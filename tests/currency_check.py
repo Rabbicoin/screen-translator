@@ -187,6 +187,17 @@ CASES = [
     ("M.R.P.: ₹549", "file:inr_amazon_ember_mrp.png:eng", "auto", [(549, "INR", True)]),
     ("₹440 (₹440 / kg) M.R.P.: ₹549", "file:inr_amazon_ember_mrp_price.png:eng", "auto",
      [(440, "INR", False), (440, "INR", False), (549, "INR", True)]),
+    # Там же, блок «Other sellers»: «₹» сверху в 5×7 точек похож на «7» больше,
+    # чем на себя. Вторая вырезка — узкая полоска в одну строку с краешком
+    # следующей: рамка слова накрывала обе, и куски цены срастались с обрезками.
+    ("2 options from ₹440.00", "file:inr_amazon_ember_options.png:eng", "auto",
+     [(440, "INR", False)]),
+    ("2 options from ₹440.00", "file:inr_amazon_ember_options_line.png:eng", "auto",
+     [(440, "INR", False)]),
+    # Та же запись шрифтами Windows из Chrome: «$19⁹⁹» читалось «$1999» — в сто
+    # раз дороже, «₹440⁰⁰» в Tahoma — «₹410.00»
+    ("$19.99", "file:usd_raised_verdana.png:eng", "auto", [(19.99, "USD", False)]),
+    ("2 options from ₹440.00", "file:inr_raised_tahoma.png:eng", "auto", [(440, "INR", False)]),
     # Arial из Chrome: зачёркнутая «1» читалась как «4» — выходило 4 299 рупий
     ("M.R.P.: ₹1,299", "file:inr_mrp_struck_arial.png:eng", "auto", [(1299, "INR", True)]),
     ("$19|99", "sup", "auto", [(19.99, "USD", False)]),

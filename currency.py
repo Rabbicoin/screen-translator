@@ -660,6 +660,10 @@ def find_prices(lines, source="auto"):
             places = CURRENCIES.get(code, (None, None, 2))[2] if code else 2
             if frac and len(frac.group(1)) != 3 and len(frac.group(1)) > max(2, places):
                 continue
+            # Число разорвано на разряде: «₹74,999» читалось «₹74, 999» и «₹74 ,999»,
+            # и выходило 74 рупии. Запятая с пробелом и три цифры за ней.
+            if code and re.match(r"(?:, | ,| , )\d{3}", norm[end:]):
+                continue
             if mult:
                 value *= mult[0]
             items.append({"start": start, "end": end, "span": (span0, span1), "code": code,
@@ -1349,6 +1353,18 @@ def _any_mark(text, side):
     return bool(_marker_before(s, len(s)))
 
 
+def _plain_mark(text):
+    """Прочитанное перед числом — знак валюты без оговорок?
+
+    Двойники («©» вместо «€», «~» вместо «₹») — метки, только если число рядом
+    записано как деньги. Пока число не разобрано, меткой их считать нельзя:
+    «°15³⁰» читалось «©1530», и с точкой перед копейками выходило 15,30 евро.
+    """
+    s = text.translate(_NORM)
+    found = _marker_before(s, len(s)) if s else None
+    return bool(found) and not hasattr(MARKERS[(found[0], "pre")][1], "search")
+
+
 def _union(a, b):
     return min(a[0], b[0]), min(a[1], b[1]), max(a[2], b[2]), max(a[3], b[3])
 
@@ -1396,7 +1412,7 @@ def _full_height(pieces, dtop, dbottom):
             and g[1] < dtop + 0.4 * dh]
 
 
-def _recheck_digits(clean, text, pieces, side, dtop, dbottom):
+def _recheck_digits(clean, text, pieces, side, dtop, dbottom, struck=False):
     """Цифры числа, у которого узнан знак, — перепроверить без знака: текст или None.
 
     Незнакомый знак вплотную сбивает распознавание и соседней цифры: в Arial
@@ -1405,32 +1421,58 @@ def _recheck_digits(clean, text, pieces, side, dtop, dbottom):
     цифры в рост (без мелких копеек сверху) одними цифрами: четверть секунды,
     поэтому только тогда. Цифр столько же — берём новые на те же места; иначе
     None: неверная сумма хуже никакой. `pieces` — куски числа без знака.
+    Сверяем все цифры, не только соседнюю: «₹440» в Tahoma читалось «₹410».
 
     За числом в том же слове бывают буквы — «(₹440/kg)» читается слитно. Их
     куски тоже в рост, но к цифрам не относятся: после знака берём столько
-    кусков, сколько цифр в числе сразу за ним.
+    кусков, сколько цифр в числе сразу за ним. Только не вплотную к числу.
     """
     full = _full_height(pieces, dtop, dbottom)
     places = [i for i, ch in enumerate(text) if ch.isdigit()]
     if side == "pre":
         run = re.match(r"\D*\d[\d.,']*", text)
-        places = [i for i in places if i < run.end()] if run else []
-        full = full[:len(places)]
+        if not run or text[run.end():run.end() + 1].isalpha() \
+                or text.startswith("//", run.end()):
+            return None         # «₹44O», «₹2,8//»: за числом недочитанные цифры
+        places = [i for i in places if i < run.end()]
+        rest, full = full[len(places):], full[:len(places)]
+        # Кусок сразу за числом, похожий на цифру больше, чем на то, чем он
+        # прочитан, — тоже недочитанная цифра: «₹2,877» читалось «2,8//».
+        if rest and run.end() < len(text):
+            ds = _distances(clean, rest[0], dtop, dbottom)
+            if min(d for d, _, ch in ds if ch.isdigit()) \
+                    < min((d for d, _, ch in ds if ch == text[run.end()]), default=9.0):
+                return None
     places = places[:len(full)]
     if not full or len(places) != len(full):
         return None
-    k = 0 if side == "pre" else -1
-    if _digit_guess(clean, full[k], dtop, dbottom) == text[places[k]]:
-        return text
+    # По одной цифры не сверить, если они слиплись (жирный или мелкий шрифт) или
+    # зачёркнуты — те сверит _check_struck, без строк линии. Тогда смотрим
+    # только на цифру у знака.
+    loose = struck or any(g[2] - g[0] >= 1.15 * (dbottom - dtop) for g in full)
+    near = 0 if side == "pre" else len(full) - 1
+
+    def settled(digits):
+        """Цифры на свои места, каждая сверена с образцами: текст или None."""
+        chars = list(text)
+        for n, (i, d, g) in enumerate(zip(places, digits, full)):
+            if not loose:
+                d = _settle_digit(d, _digit_dists(clean, g, dtop, dbottom))
+            elif n == near and digits is not got and _digit_guess(clean, g, dtop, dbottom) != d:
+                d = None
+            if d is None:
+                return None
+            chars[i] = d
+        return "".join(chars)
+
+    got = None
+    done = settled([text[i] for i in places])
+    if done:
+        return done
     got = _read_digits(clean, (full[0][0], min(g[1] for g in full),
                                full[-1][2], max(g[3] for g in full)), seps=True)
     got = re.sub(r"\D", "", got or "")
-    if len(got) != len(full):
-        return None
-    chars = list(text)
-    for i, d in zip(places, got):
-        chars[i] = d
-    return "".join(chars)
+    return settled(got) if len(got) == len(full) else None
 
 
 def _raised_run(clean, glyph, dtop, dbottom):
@@ -1444,8 +1486,8 @@ def _raised_run(clean, glyph, dtop, dbottom):
     """
     dh = dbottom - dtop
     # мельче трети цифры — не знак, а обломок буквы: засечка «T» в Georgia
-    if not (0.3 * dh <= glyph[3] - glyph[1] < 0.75 * dh and glyph[1] < dtop + 0.2 * dh
-            and glyph[3] < dbottom - 0.25 * dh):
+    if not (0.3 * dh <= glyph[3] - glyph[1] < 0.9 * dh and glyph[1] < dtop + 0.2 * dh
+            and glyph[3] < dbottom - 0.15 * dh):
         return None
     strip = _blobs(clean, (glyph[2], dtop - dh // 4, glyph[2] + 14 * dh, dbottom + dh // 4))
     run, tail, seps, prev = [], [], 0, glyph
@@ -1453,42 +1495,175 @@ def _raised_run(clean, glyph, dtop, dbottom):
         if g[0] - prev[2] > 0.45 * dh:
             break
         h = g[3] - g[1]
+        if h < 0.15 * dh and g[2] - g[0] < 0.15 * dh:
+            continue                                # соринка, а не знак
         if not tail and h >= 0.8 * dh and abs(g[1] - dtop) <= 0.12 * dh \
                 and abs(g[3] - dbottom) <= 0.12 * dh:
             run.append(g)
-        elif not tail and run and h <= 0.35 * dh and g[1] >= dbottom - 0.3 * dh:
+        elif not tail and run and h <= 0.45 * dh and g[1] >= dbottom - 0.3 * dh:
             seps += 1                               # точка или запятая между разрядами
         elif run and 0.3 * dh <= h < 0.75 * dh and g[1] < dtop + 0.2 * dh \
-                and g[3] < dbottom - 0.25 * dh:
+                and g[3] < dbottom - 0.35 * dh:
             tail.append(g)
         else:
             break
         prev = g
-    return (run, tail, seps) if run else None
-
-
-def _number_at_sign(clean, run, tail, seps, dtop, dbottom, langs):
-    """Число цены с мелким знаком сверху — читаем заново, отдельно от знака.
-
-    Мелкий знак сбивает распознавание всего слова: «₹440» шрифтом Amazon
-    читалось «2AAO», «AAD», «FAA» — цифры стали буквами. Те же цифры, вырезанные
-    без знака, читаются верно. Берём, только если вышли одни цифры, их столько
-    же, сколько кусков в рост на картинке, а точек и запятых не больше, чем
-    нарисовано: неверная сумма хуже никакой. Копейки мелко сверху дочитываем
-    отдельно. Четверть секунды, поэтому только когда прочитанное с картинкой
-    не сходится.
-    """
-    got = _reread(clean, (run[0][0], min(g[1] for g in run),
-                          run[-1][2], max(g[3] for g in run)), langs)
-    got = (got or "").rstrip(".,'")
-    if not re.fullmatch(r"\d[\d.,']*", got) or sum(ch.isdigit() for ch in got) != len(run) \
-            or len(re.findall(r"[.,']", got)) > seps:
+    # Копеек — одна-две цифры. Больше — это не копейки, а цифры старого стиля:
+    # в Georgia «0», «1», «2» мельче остальных и стоят выше низа «4» и «9».
+    if not run or _cents_count(tail) > 2:
         return None
-    if tail:
-        cents = _read_cents(clean, tail[0][0], (tail[0][0], dtop, tail[-1][2], dbottom))
-        if cents:
-            got = f"{got}.{cents.ljust(2, '0')}"
-    return got
+    # Знак «$» выше цифры и свисает ниже строки, поэтому мерки для знака выше
+    # свободные. Но без копеек сверху цена ли это — неясно, и знак должен быть
+    # заметно мельче цифр и висеть заметно выше их низа.
+    if not tail and not (glyph[3] - glyph[1] < 0.75 * dh and glyph[3] < dbottom - 0.25 * dh):
+        return None
+    return run, tail, seps
+
+
+def _cents_count(tail):
+    """Сколько цифр в кусках копеек: слипшаяся пара («00») — один кусок на две."""
+    return sum(2 if g[2] - g[0] >= 1.05 * (g[3] - g[1]) else 1 for g in tail)
+
+
+def _digit_dists(gray, box, dtop, dbottom, skip=None):
+    """Насколько кусок похож на каждую цифру: {'0': расстояние, ..., '9': расстояние}."""
+    best = {}
+    for d, _, ch in _distances(gray, box, dtop, dbottom, skip):
+        if ch.isdigit() and d < best.get(ch, 9.0):
+            best[ch] = d
+    return best
+
+
+def _settle_digit(read, best):
+    """Прочитанная цифра против образцов (`best` — из _digit_dists) -> цифра или None.
+
+    На стенде цен с мелким знаком сверху: где прочитанное и образцы совпали,
+    ошибок нет; где разошлись — почти всегда правы образцы, а распознавание
+    увидело вместо цифры палочку: «4» -> «1» (Tahoma), «2» -> «7». Такое правим
+    по образцам. Перевес образцов до 0,01 — не расхождение. В остальном не ясно,
+    кто прав (образцы путают «9» с «7»), и цифры нет — None.
+    """
+    guess = min(best, key=best.get)
+    lead = best[read] - best[guess]
+    # Дальше 0,2 от любой цифры — кусок не цифра (слиплась с соседом, точкой,
+    # знаком): образцам сказать нечего, остаётся прочитанное.
+    if lead < 0.01 or best[guess] > 0.2:
+        return read
+    if read in "17" and guess not in "17" and lead >= 0.02:
+        return guess
+    return None
+
+
+# Знаки, которые пишут перед числом и у валют которых есть копейки: только такой
+# знак бывает в начале цены «мелкий знак — цифры — мелкие копейки»
+_PRICE_SIGNS = "$€£¥₹₪₱฿₺"
+
+
+def _price_sign(clean, glyph):
+    """Мелкий знак перед ценой с мелкими копейками сверху («₹440⁰⁰») — редкий знак или None.
+
+    Так пишут только цены, поэтому первый кусок — знак валюты, а не цифра и не
+    буква. Общая сверка этого не знает: крошечный «₹» (5×7 точек при масштабе
+    100 %) похож на «7» чуть больше, чем на себя, и она его отвергала. Здесь
+    выбираем среди знаков валют: лучший должен заметно опережать второй и быть
+    почти не хуже лучшей догадки вообще — «*» и «™» на знаки не похожи совсем.
+    Знаки, которые пишут после числа («₮», «₸»), не соперники, пока не ближе.
+    """
+    best = {}
+    for d, _, ch in _distances(clean, glyph, glyph[1], glyph[3]):
+        if d < best.get(ch, 9.0):
+            best[ch] = d
+    ranked = sorted((best[ch], ch) for ch in _PRICE_SIGNS if ch in best)
+    if len(ranked) < 2:
+        return None
+    (d, sign), (second, _) = ranked[:2]
+    after = min((v for ch, v in best.items() if ch in RARE_SIGNS and ch not in _PRICE_SIGNS),
+                default=9.0)
+    if sign in RARE_SIGNS and second - d >= 0.03 and d <= min(best.values()) + _SIGN_MARGIN \
+            and d <= after + _SIGN_TIE:
+        return sign
+    return None
+
+
+def _raised_number(clean, body, covered, raised, dtop, dbottom, langs, may_reread):
+    """Число цены с мелким знаком сверху -> (число или None, сомнительно ли, перечитано ли).
+
+    `body` — что прочитано за знаком, `raised` — что нарисовано (из _raised_run).
+    Мелкий знак сбивает распознавание всего слова: «₹440» шрифтом Amazon
+    читалось «2AAO», «AAD», «FAA», «₹440⁰⁰» — «44.0», а «$19⁹⁹» — «$1999», в сто
+    раз дороже. Поэтому прочитанному верим, только если оно сходится с
+    картинкой: букв нет, число не вышло за рамку слова (`covered`), цифр столько
+    же, сколько кусков в рост (или вместе с копейками), точек и запятых не
+    больше, чем нарисовано, а каждая цифра похожа на себя (_settle_digit). Иначе
+    читаем цифры заново, отдельно от знака, и сверяем так же — четверть секунды,
+    поэтому только тогда и только если `may_reread`.
+
+    Не сошлось и после этого — цена сомнительна, и показывать её нельзя:
+    неверная сумма хуже никакой. Копейки сверху отделяем точкой; не прочитаны
+    вместе с числом — читаем отдельно.
+    """
+    run, tail, seps = raised
+    n, ncents = len(run), _cents_count(tail)
+    dh = dbottom - dtop
+
+    def settled(whole):
+        """Цифры числа против образцов: число с поправленными цифрами или None."""
+        chars = list(whole)
+        for i, g in zip((i for i, ch in enumerate(whole) if ch.isdigit()), run):
+            chars[i] = _settle_digit(chars[i], _digit_dists(clean, g, dtop, dbottom))
+            if chars[i] is None:
+                return None
+        return "".join(chars)
+
+    digits = re.sub(r"\D", "", body)
+    whole = cents = None
+    if covered and not re.search(r"[^\W\d_]", body) and len(digits) in (n, n + ncents):
+        at = [i for i, ch in enumerate(body) if ch.isdigit()]
+        whole = body[at[0]:at[n - 1] + 1]
+        whole = settled(whole) if len(re.findall(r"[.,']", whole)) <= seps else None
+        if whole and tail and len(digits) == n + ncents:
+            cents = digits[n:]
+    reread = whole is None and may_reread
+    if reread:
+        whole = _reread(clean, (run[0][0], min(g[1] for g in run),
+                                run[-1][2], max(g[3] for g in run)), langs)
+        whole = (whole or "").rstrip(".,'")
+        if re.fullmatch(r"\d[\d.,']*", whole) and sum(ch.isdigit() for ch in whole) == n \
+                and len(re.findall(r"[.,']", whole)) <= seps:
+            whole = settled(whole)
+        else:
+            whole = None
+    if whole is None:
+        # Слипшиеся цифры (жирный шрифт) — один кусок на две, счёт кусков неверен,
+        # и судить о прочитанном нельзя: тогда не сомневаемся, а оставляем как есть.
+        return None, all(g[2] - g[0] < 1.15 * dh for g in run), reread
+    if not tail:
+        return whole, False, reread
+    top, bottom = min(g[1] for g in tail), max(g[3] for g in tail)
+    if cents is None:
+        # _read_cents берёт верхние три четверти рамки — рамку строим от самих копеек
+        cents = _read_cents(clean, tail[0][0], (tail[0][0], max(0, top - 1), tail[-1][2],
+                                                top + int((bottom - top + 2) / 0.75) + 1))
+    if ncents == len(tail):
+        dists = [_digit_dists(clean, g, top, bottom) for g in tail]
+        guess = "".join(min(best, key=best.get) for best in dists)
+        if cents and len(cents) == ncents:
+            # мелкий «0» образцы принимают за «8» — тут верим прочитанному
+            fixed = [r if (r, t) == ("0", "8") else _settle_digit(r, best)
+                     for r, t, best in zip(cents, guess, dists)]
+            cents = None if None in fixed else "".join(fixed)
+        elif cents and cents in guess:
+            cents = guess                   # прочитана одна цифра из двух — вторая по образцам
+        else:
+            cents = None
+    elif not cents or len(cents) != ncents:
+        cents = None
+    if cents is None:
+        # копейки не разобрать: у сотен и тысяч без них можно, у «19⁹⁹» — нельзя
+        if len(re.sub(r"\D", "", whole)) >= 3:
+            return whole, False, reread
+        return None, True, reread
+    return f"{whole}.{cents}", False, reread
 
 
 def _own_blobs(clean, row, k):
@@ -1499,8 +1674,34 @@ def _own_blobs(clean, row, k):
     кусок сбивал счёт знаков, и «₹», прочитанный цифрой «2», не правился.
     Снимаем только знаки препинания: короткое слово у числа может быть знаком
     валюты («100 ₴» читается «100 @»), а его кусок собирается из обеих рамок.
+
+    И по высоте: в узкой полоске из одной строки с краешком соседней рамка слова
+    накрывает обе, и куски цены срастались с обрезками букв снизу. Берём только
+    самую высокую полосу чернил — саму строку — и то, что к ней вплотную.
     """
-    blobs = _blobs(clean, row[k][1])
+    x0, y0, x1, y1 = (int(v) for v in row[k][1])
+    y0, y1 = max(0, y0), min(clean.height, y1)
+    if x1 - x0 >= 2 and y1 - y0 >= 2:
+        ink = clean.crop((max(0, x0), y0, min(clean.width, x1), y1))
+        rows = ink.point(lambda v: 255 if v < 140 else 0).resize((1, y1 - y0), Image.BOX)
+        rows = list(rows.getdata()) + [0, 0]
+        runs, start = [], None
+        for y, v in enumerate(rows[:-1]):
+            if v and start is None:
+                start = y
+            elif not v and start is not None and not rows[y + 1]:
+                runs.append((start, y))             # пустых строк две подряд — полоса кончилась
+                start = None
+        if runs:
+            top, bottom = max(runs, key=lambda r: r[1] - r[0])
+            # отдельные штрихи самого знака — черта над «₸», черта под «₫» —
+            # отстоят на волос, а соседняя строка — на четверть роста и дальше
+            near = 0.25 * (bottom - top)
+            for a, b in sorted(runs, key=lambda r: abs(r[0] - top)):
+                if a < bottom + near and b > top - near:
+                    top, bottom = min(top, a), max(bottom, b)
+            y0, y1 = y0 + top, y0 + bottom
+    blobs = _blobs(clean, (x0, y0, x1, y1))
     for near, end in ((k + 1, -1), (k - 1, 0)):
         if not 0 <= near < len(row):
             continue
@@ -1579,42 +1780,57 @@ def _find_rare_signs(rows, clean, scale, langs="eng"):
                 continue
             dtop, dbottom = band
             dh = max(1, dbottom - dtop)
-            # обрезок соседнего знака у левого края снимка — не начало слова:
-            # выделяют часто впритык, и от «%» перед ценой остаётся полоска
-            first = blobs[1] if len(blobs) > 2 and blobs[0][0] <= 0 else blobs[0]
-            raised = _raised_run(clean, first, dtop, dbottom) if len(blobs) > 1 else None
+            # Цена с мелким знаком сверху. Знак — первый кусок слова, но перед ним
+            # бывает чужое: обрезок у левого края снимка (выделяют впритык, и от
+            # «%» перед ценой остаётся полоска) или прилипший хвост соседнего
+            # слова через пробел («from ₹440⁰⁰» -> «m*440.00»).
+            # «$19⁹⁹»: мелких кусков (знак и копейки) больше, чем цифр в рост, и
+            # середина по всем кускам — уже не рост цифр. Тогда меряем по самым высоким.
+            high = max(g[3] - g[1] for g in blobs)
+            first, raised, rband = blobs[0], None, band
+            for i in range(min(3, len(blobs) - 1)):
+                if i and blobs[i - 1][0] > 0 and blobs[i][0] - blobs[i - 1][2] < 0.35 * dh:
+                    continue
+                for rband in (band, _digit_band([g for g in blobs[i:]
+                                                 if g[3] - g[1] >= 0.8 * high])):
+                    raised = rband and _raised_run(clean, blobs[i], *rband)
+                    if raised:
+                        break
+                if raised:
+                    first = blobs[i]
+                    break
+            rband = rband or band
             # цена занимает слово до конца: «₹99/мес» разбирается ниже, как раньше
-            if raised and (raised[1] or raised[0])[-1][2] < blobs[-1][2] - 0.2 * dh:
+            if raised and (raised[1] or raised[0])[-1][2] \
+                    < blobs[-1][2] - 0.2 * (rband[1] - rband[0]):
                 raised = None
             if raised:
-                # Мелкий знак сверху, за ним цифры в рост. Прочитанному верим,
-                # только если оно сходится с картинкой: цифр столько же, сколько
-                # кусков, букв среди них нет, число не вышло за рамку слова,
-                # первая цифра похожа на себя, а точек и запятых не больше, чем
-                # нарисовано («₹440⁰⁰» читалось «44.0»). Иначе читаем число заново.
-                run, tail, seps = raised
+                # Мелкий знак сверху, за ним цифры в рост — цена, как на Amazon.
+                run, tail, _ = raised
+                rtop, rbottom = rband
                 edge = text[:has_digit.start()] if has_digit else ""
-                body = text[len(edge):]
-                digits = re.sub(r"\D", "", body)
-                with_cents = bool(tail) and len(digits) == len(run) + len(tail)
                 sign, margin = None, 0.0
                 if not (edge and _sure_mark(edge, "pre")):      # «€19⁹⁹» — знак и так верный
                     budget -= 2
-                    sign, margin = _edge_sign(clean, first, run, "pre", dtop, dbottom, 0.0)
+                    sign, margin = _edge_sign(clean, first, run, "pre", rtop, rbottom, 0.0)
+                    if tail:
+                        # с копейками сверху знак — только из тех, что пишут перед
+                        # числом: мелкий «₪» общая сверка принимала за «₴»
+                        if not sign or sign not in _PRICE_SIGNS or margin < _SIGN_MARGIN:
+                            sign, margin = _price_sign(clean, first), _SIGN_MARGIN
                 strong = sign and margin >= _SIGN_MARGIN
-                mark = sign if strong else edge if edge and _any_mark(edge, "pre") else ""
+                mark = sign if strong else edge if _plain_mark(edge) else ""
                 number = None
-                if not (mark or sign):
-                    pass        # не знак: в Georgia «1» и «2» мельче и выше соседних цифр
-                elif run[-1][2] > b[2] + 0.2 * dh or re.search(r"[^\W\d_]", body) \
-                        or len(digits) not in (len(run), len(run) + len(tail)) \
-                        or len(re.findall(r"\d[.,'](?=\d)", body)) > seps + with_cents \
-                        or _digit_guess(clean, run[0], dtop, dbottom) != digits[0]:
-                    if rereads > 0:
-                        rereads -= 1
-                        number = _number_at_sign(clean, run, tail, seps, dtop, dbottom, langs)
-                elif strong:
-                    number = body
+                # ни знака, ни метки — не цена: в Georgia «1» и «2» мельче и выше
+                # соседних цифр и выглядят так же
+                if mark or sign:
+                    number, doubt, used = _raised_number(
+                        clean, text[len(edge):], run[-1][2] <= b[2] + 0.2 * (rbottom - rtop),
+                        raised, rtop, rbottom, langs, rereads > 0)
+                    rereads -= used
+                    if doubt:
+                        wd["doubt"] = True
+                        continue
                 if number and not mark:
                     # знак узнан неуверенно — число без него не трогаем, а правим,
                     # только если тот же знак найдётся на снимке уверенно
@@ -1629,10 +1845,11 @@ def _find_rare_signs(rows, clean, scale, langs="eng"):
                     while k + 1 < len(row) and sum(row[k + 1][1][0::2]) / 2 < max(end, b[2]):
                         del row[k + 1]
                     if end > b[2]:
-                        b = (b[0], min(b[1], dtop), end, max(b[3], dbottom))
+                        b = (b[0], min(b[1], rtop), end, max(b[3], rbottom))
                         row[k] = (wd, b)
                         wd["box"] = tuple(int(round(v / scale)) for v in b)
-                    continue
+                if number or tail:
+                    continue        # с копейками сверху по-другому не разобрать
             if not has_digit:
                 continue
             # буква между цифрами («₿100» читалось «B1i00»): где тут число —
@@ -1764,7 +1981,7 @@ def _find_rare_signs(rows, clean, scale, langs="eng"):
                             text = None
                         if text:
                             text = _recheck_digits(clean, text, [g for g in tall if g is not glyph],
-                                                   side, dtop, dbottom)
+                                                   side, dtop, dbottom, wd["strike"])
                         if text and margin < _SIGN_MARGIN and not (
                                 as_digit and _far_from_digits(clean, glyph, dtop, dbottom, sign)):
                             # Неуверенно, но цифры на этом месте тоже не видно:
@@ -1911,10 +2128,7 @@ def _check_struck(rows, clean, strikes, sure):
             for i, g in zip(places, pieces):
                 if not g or not chars[i].isdigit():
                     continue
-                best = {}
-                for d, _, ch in _distances(clean, g, dtop, dbottom, skip):
-                    if ch.isdigit() and d < best.get(ch, 9.0):
-                        best[ch] = d
+                best = _digit_dists(clean, g, dtop, dbottom, skip)
                 guess = min(best, key=best.get)
                 lead = best[chars[i]] - best[guess]
                 if (chars[i], guess) in _STRUCK_SWAPS and lead >= _STRUCK_SWAP_MARGIN:
