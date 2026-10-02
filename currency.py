@@ -1890,7 +1890,10 @@ def _find_rare_signs(rows, clean, scale, langs="eng"):
                     return edge, None
                 nwd, nb = row[near]
                 gap = b[0] - nb[2] if side == "pre" else nb[0] - b[2]
-                return edge, ((nwd, nb) if gap <= 1.0 * dh else None)
+                # рамка карточки рядом с ценой («|» выше строки вдвое) — не знак, и
+                # из-за неё до самого знака в слове дело не доходило
+                tall_line = nb[3] - nb[1] > 1.6 * (b[3] - b[1]) and nwd["text"] in "|[]!lI"
+                return edge, ((nwd, nb) if gap <= 1.0 * dh and not tall_line else None)
 
             for side in ("pre", "post"):
                 if budget <= 0:
@@ -2093,6 +2096,8 @@ def _own_glyphs(rows, clean, signs):
             if len(chars) != len(full) or any(g[2] - g[0] >= 1.15 * dh for g in full):
                 continue
             for n, (ch, g) in enumerate(zip(chars, full)):
+                if n == 0 and ch.isdigit():
+                    continue        # первая цифра бывает непрочитанным знаком: «7959.00»
                 if not ch.isdigit():
                     mark = MARKERS.get((ch, "pre")) if n == 0 else None
                     ch = ch if ch in signs else \
@@ -2108,8 +2113,8 @@ def _own_glyphs(rows, clean, signs):
 
 
 def _own_sign(own, clean, box, dtop, dbottom, skip, signs, rivals):
-    """Зачёркнутый кусок похож на знак со снимка заметно больше, чем на цифры оттуда же?
-    -> знак или None. Строки линии (`skip`) не сравниваем.
+    """Кусок похож на знак со снимка заметно больше, чем на цифры оттуда же?
+    -> знак или None. Строки линии зачёркивания (`skip`, если есть) не сравниваем.
 
     `rivals` — цифры, за которые кусок принимают распознавание и образцы. Их на
     снимке должно быть с чем сравнить: в «₹999 7̶,̶4̶9̶9̶» семёрки без линии нет,
@@ -2129,8 +2134,8 @@ def _own_sign(own, clean, box, dtop, dbottom, skip, signs, rivals):
     w, h = box[2] - box[0], box[3] - box[1]
     side = max(w, h)
     top = box[1] - (side - h) // 2
-    r0 = max(0, (skip[0] - top) * _TILE // side)
-    r1 = min(_TILE, -(-(skip[1] + 1 - top) * _TILE // side))
+    r0 = max(0, (skip[0] - top) * _TILE // side) if skip else 0
+    r1 = min(_TILE, -(-(skip[1] + 1 - top) * _TILE // side)) if skip else 0
     if 0 < r1 - r0 < _TILE:
         mask = Image.new("L", (_TILE, _TILE), 255)
         mask.paste(0, (0, r0, _TILE, r1))
@@ -2149,6 +2154,76 @@ def _own_sign(own, clean, box, dtop, dbottom, skip, signs, rivals):
         return None
     d, sign = min((v, s) for s, v in best.items())
     return sign if d + _OWN_MARGIN <= digit else None
+
+
+def _settle_signs(rows, clean, sure):
+    """Знак, которого распознавание не прочло или прочло цифрой, — по знакам со снимка.
+
+    В плитках вариантов Amazon при 100 % «₹1,320.00» читалось «1,320.00», а
+    «₹959.00» — «7959.00». Образцы шрифтов Windows узнают такой «₹» слабо
+    (запас 0,01 при нужных 0,02), и цена пропадала. Но на снимке рядом тот же
+    знак тем же кеглем узнан уверенно («₹880.00») — с ним и сравниваем, как
+    зачёркнутые (_own_sign). Число кусков в рост должно сойтись: на один больше
+    прочитанного — знак не прочитан, столько же — прочитан цифрой.
+
+    Цифра, с которой кусок путают, должна быть и на снимке, иначе сравнивать
+    не с чем; нет её — кусок должен быть далёк от образцов этой цифры.
+    """
+    if not sure:
+        return
+    own, budget = None, 16
+    for row in rows.values():
+        row.sort(key=lambda wb: wb[1][0])
+        for k, (wd, b) in enumerate(row):
+            text = wd["text"]
+            core = text.lstrip("([{")
+            if budget <= 0 or wd["strike"] or not core[:1].isdigit():
+                continue
+            blobs = _own_blobs(clean, row, k)
+            band = _digit_band(blobs)
+            if not band:
+                continue
+            dtop, dbottom = band
+            dh = dbottom - dtop
+            # знак у числа есть — сзади: в самом слове или вплотную за ним
+            # (следующая цена «₹959.00» через пробел знаком этой не считается)
+            tail = text[max(i for i, ch in enumerate(text) if ch.isdigit()) + 1:]
+            nxt = row[k + 1] if k + 1 < len(row) else None
+            after = tail or (nxt[0]["text"] if nxt and nxt[1][0] - b[2] <= 0.5 * dh else "")
+            if _any_mark(after, "post"):
+                continue
+            if len(core) < len(text):           # скобка — узкая и в рост цифры
+                if not blobs or blobs[0][2] - blobs[0][0] > 0.5 * dh \
+                        or blobs[0][3] - blobs[0][1] < 0.9 * dh:
+                    continue
+                blobs = blobs[1:]
+            full = _full_height(blobs, dtop, dbottom)
+            drawn = sum(2 if g[2] - g[0] >= 1.3 * dh else 1 for g in full)
+            read = len(_SIGNIFICANT.findall(core))
+            # слипшиеся цифры («440» одним куском) — кроме копеек в конце: тогда
+            # куски с буквами не сопоставить, и «(₹440.00» выходило «₹40.00»
+            # и у одиночной цифры счёт ничего не доказывает: «3 offers» -> «₹3»
+            if len(full) < 2 or sum(ch.isdigit() for ch in core) < 2 \
+                    or drawn not in (read, read + 1) \
+                    or any(g[2] - g[0] >= 1.15 * dh for g in full[:-1]):
+                continue
+            budget -= 1
+            if own is None:
+                own = _own_glyphs(rows, clean, sure)
+            ds = _digit_dists(clean, full[0], dtop, dbottom)
+            rivals = {min(ds, key=ds.get)} | ({core[0]} if drawn == read else set())
+            present = rivals & {ch for ch, _, _ in own}
+            if any(ds[d] < _STRUCK_NOT_DIGIT for d in rivals - present):
+                continue
+            sign = _own_sign(own, clean, full[0], dtop, dbottom, None, sure, present)
+            if not sign:
+                continue
+            # Не прочитан знак или прочитан цифрой? Слипшиеся «00» сбивают счёт
+            # кусков, поэтому смотрим и на второй кусок: похож на первую цифру —
+            # знак не прочитан («(440.00» при «₹440⁰⁰» — не «₹40.00»).
+            unread = drawn == read + 1 or len(full) > 1 \
+                and _digit_guess(clean, full[1], dtop, dbottom) == core[0]
+            wd["text"] = text[:len(text) - len(core)] + sign + (core if unread else core[1:])
 
 
 # До какой высоты цифр (в точках снимка, без увеличения) зачёркнутое число
@@ -2394,6 +2469,7 @@ def read_lines(img, langs="eng", scale=2.0):
             wd["text"] = again
     _dollar_or_s(rows, clean)
     sure = _find_rare_signs(rows, clean, scale, langs)
+    _settle_signs(rows, clean, sure)
     _check_struck(rows, clean, strikes, sure, gray, scale)
     lines = [sorted((wd for wd, _ in ws), key=lambda w: w["box"][0]) for ws in rows.values()]
     lines.sort(key=lambda ws: (min(w["box"][1] for w in ws), ws[0]["box"][0]))
