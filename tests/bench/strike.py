@@ -54,6 +54,11 @@ VARIANTS = [(f, s, c, d)
             for f, s in (("Arial", 12), ("Arial", 14), ("Segoe UI", 13), ("Verdana", 12),
                          ("Tahoma", 13), ("Georgia", 14), ("Trebuchet MS", 13))
             for c in ("#565959", "#0F1111") for d in (1.0, 1.25, 1.5)]
+# мелкие: цифры в 7–9 точек, как старая цена в плитках Amazon при масштабе 100 %
+VARIANTS += [(f, s, "#565959", d)
+             for f, s in (("Arial", 10), ("Segoe UI", 11), ("Verdana", 10), ("Tahoma", 10),
+                          ("Georgia", 11), ("Trebuchet MS", 11))
+             for d in (1.0, 1.25)]
 CELL_W, CELL_H, COLS = 300, 48, 4
 
 

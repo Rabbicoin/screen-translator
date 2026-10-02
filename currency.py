@@ -19,6 +19,7 @@
 Всё, что рисует окна и меню, живёт в основном файле: этому модулю Tk не нужен.
 """
 
+import collections
 import hashlib
 import json
 import math
@@ -2054,7 +2055,142 @@ _STRUCK_SWAP_MARGIN = 0.015
 _STRUCK_DOUBT_MARGIN = 0.03
 
 
-def _check_struck(rows, clean, strikes, sure):
+# На сколько знак со снимка должен быть ближе цифр со снимка, чтобы зачёркнутый
+# кусок счесть знаком: у знаков вышло 0,07–0,15, у цифр — меньше нуля.
+_OWN_MARGIN = 0.04
+
+
+def _own_glyphs(rows, clean, signs):
+    """Знаки и цифры этого снимка, прочитанные без линии: [(символ, клетка, геометрия)].
+
+    Образцы из шрифтов Windows не знают шрифта сайта, а мелкий серый «₹» под
+    линией (старая цена в плитках Amazon, 11 px) на них не похож — ни на «₹»,
+    ни на цифры. Зато тот же «₹» тем же кеглем рядом без линии: в «(₹440 / kg)».
+    Распознавание его читает «%», но разбор знает, что «%» перед числом — рупия.
+    Берём куски слов, где кусков в рост столько же, сколько знаков. Цифру — только
+    если и образцы считают её той же цифрой: «₹» здесь же читается и «2», и «7».
+    """
+    out, count = [], collections.Counter()
+    for row in rows.values():
+        for k, (wd, b) in enumerate(row):
+            text = wd["text"]
+            if wd["strike"] or not re.search(r"\d", text) or len(out) >= 60:
+                continue
+            blobs = _own_blobs(clean, row, k)
+            band = _digit_band(blobs)
+            if not band:
+                continue
+            dtop, dbottom = band
+            dh = dbottom - dtop
+            core = text.lstrip("([{")
+            if len(core) < len(text):           # скобка — узкая и в рост цифры
+                if not blobs or blobs[0][2] - blobs[0][0] > 0.5 * dh \
+                        or blobs[0][3] - blobs[0][1] < 0.9 * dh:
+                    continue
+                blobs = blobs[1:]
+            full = _full_height(blobs, dtop, dbottom)
+            chars = _SIGNIFICANT.findall(core)
+            if len(chars) != len(full) or any(g[2] - g[0] >= 1.15 * dh for g in full):
+                continue
+            for n, (ch, g) in enumerate(zip(chars, full)):
+                if not ch.isdigit():
+                    mark = MARKERS.get((ch, "pre")) if n == 0 else None
+                    ch = ch if ch in signs else \
+                        symbol(mark[0][0]) if mark and mark[1] is False else ""
+                    if ch not in signs:
+                        continue
+                if count[ch] >= (8 if ch in signs else 4) \
+                        or ch.isdigit() and _digit_guess(clean, g, dtop, dbottom) != ch:
+                    continue
+                count[ch] += 1
+                out.append((ch,) + _glyph_features(clean, g, dtop, dbottom))
+    return out
+
+
+def _own_sign(own, clean, box, dtop, dbottom, skip, signs, rivals):
+    """Зачёркнутый кусок похож на знак со снимка заметно больше, чем на цифры оттуда же?
+    -> знак или None. Строки линии (`skip`) не сравниваем.
+
+    `rivals` — цифры, за которые кусок принимают распознавание и образцы. Их на
+    снимке должно быть с чем сравнить: в «₹999 7̶,̶4̶9̶9̶» семёрки без линии нет,
+    и зачёркнутая «7» в Arial оказывалась ближе к «₹», чем к девяткам.
+    """
+    if not own or not set(rivals) <= {ch for ch, _, _ in own}:
+        return None
+    # Бледный знак под линией порог 140 обрезает: от «₹» в 11 px оставались одни
+    # перекладины. Границы куска уточняем порогом мягче — в тех же столбцах.
+    soft = [g for g in _blobs(clean, (box[0] - 1, dtop - 2, box[2] + 1, dbottom + 2), 180)
+            if g[3] - g[1] >= 2]
+    if soft:
+        box = (min(g[0] for g in soft), min(g[1] for g in soft),
+               max(g[2] for g in soft), max(g[3] for g in soft))
+    tile, geo = _glyph_features(clean, box, dtop, dbottom)
+    mask, gain = None, 1.0
+    w, h = box[2] - box[0], box[3] - box[1]
+    side = max(w, h)
+    top = box[1] - (side - h) // 2
+    r0 = max(0, (skip[0] - top) * _TILE // side)
+    r1 = min(_TILE, -(-(skip[1] + 1 - top) * _TILE // side))
+    if 0 < r1 - r0 < _TILE:
+        mask = Image.new("L", (_TILE, _TILE), 255)
+        mask.paste(0, (0, r0, _TILE, r1))
+        gain = _TILE / (_TILE - (r1 - r0))
+    best = {}
+    for ch, t, g in own:
+        diff = ImageChops.difference(tile, t)
+        if mask:
+            diff = ImageChops.multiply(diff, mask)
+        d = sum(diff.getdata()) / (_TILE * _TILE * 255) * gain \
+            + sum(wt * abs(a - q) for wt, a, q in zip(_GEO_WEIGHTS, g, geo))
+        key = "digit" if ch.isdigit() else ch
+        best[key] = min(best.get(key, 9.0), d)
+    digit = best.pop("digit", None)
+    if digit is None or not best:
+        return None
+    d, sign = min((v, s) for s, v in best.items())
+    return sign if d + _OWN_MARGIN <= digit else None
+
+
+# До какой высоты цифр (в точках снимка, без увеличения) зачёркнутое число
+# проверяем вторым чтением. Цифры в 7–8 точек — старая цена в плитках Amazon при
+# масштабе 100 % — под линией читаются плохо: на стенде мелких кеглей из 157
+# прочитанных сумм 55 были неверны. Где второе чтение совпало с первым — 83 верны,
+# 9 неверны; остальные не показываем. Крупнее ошибок мало, а второе чтение там
+# хуже первого (линия по перемычке «9» делает её «0») — его не спрашиваем.
+_STRUCK_SMALL = 8
+
+
+def _reread_struck(gray, pieces, line, dtop, dbottom):
+    """Цифры зачёркнутого числа, перечитанные заново: '1098' или None.
+
+    Линию не стираем, а закрашиваем: каждую её строку — переходом от точки над
+    линией к точке под ней. Стёртая линия оставляла в цифрах просвет, и «8»
+    становилась «2», а «9» — «0»; закраска дорисовывает штрих, который линия
+    пересекла. Картинка — `gray` из read_lines: увеличенная, до стирания линий.
+    """
+    dh = dbottom - dtop
+    x0, x1 = max(0, pieces[0][0] - 3), min(gray.width, pieces[-1][2] + 3)
+    y0, y1 = max(0, dtop - dh // 3), min(gray.height, dbottom + dh // 3)
+    crop = gray.crop((x0, y0, x1, y1))
+    px = crop.load()
+    a, b = line[2] - 1 - y0, line[3] + 1 - y0
+    if 1 <= a and b + 1 < crop.height:
+        for x in range(crop.width):
+            top, bottom = px[x, a - 1], px[x, b + 1]
+            for y in range(a, b + 1):
+                px[x, y] = int(top + (bottom - top) * (y - a + 1) / (b - a + 2))
+    crop = ImageOps.autocontrast(crop.resize((crop.width * 3 // 2, crop.height * 3 // 2),
+                                             Image.BICUBIC))
+    crop = ImageOps.expand(crop, border=16, fill=255)
+    try:
+        got = pytesseract.image_to_string(
+            crop, config="--oem 3 --psm 7 -c tessedit_char_whitelist=0123456789.,").strip()
+    except Exception:
+        return None
+    return re.sub(r"\D", "", got) or None
+
+
+def _check_struck(rows, clean, strikes, sure, gray=None, scale=1.0):
     """Зачёркнутые цены: знак валюты берём по окружению, цифры сверяем с образцами.
 
     Линия зачёркивания портит и знак, и цифры. Знак после стирания линии на
@@ -2066,8 +2202,17 @@ def _check_struck(rows, clean, strikes, sure):
     линия. Замеры — на стенде зачёркнутых цен (семь шрифтов, три масштаба):
     где прочитанное и образцы совпали, ошибок не было ни одной. Где разошлись
     всерьёз — слово помечаем `doubt`, и find_prices такую цену не берёт.
+    Мелкие цифры (до _STRUCK_SMALL точек) ещё и перечитываем (_reread_struck):
+    не совпало — тоже `doubt`. `gray` — картинка до стирания линий, `scale` —
+    во сколько раз она крупнее снимка.
+
+    Знак под линией в 11 px (плитки Amazon при 100 %) не похож ни на образцы
+    «₹», ни на цифры. Его сравниваем со знаками и цифрами с этого же снимка
+    (_own_glyphs, _own_sign): там тот же шрифт и кегль.
     """
     budget = 12                     # зачёркнутых слов на снимок, по ~20 мс
+    rereads = 8                     # вторых чтений мелких цифр, по ~0,1 с
+    own = None                      # знаки и цифры с этого же снимка — по надобности
     for row in rows.values():
         row.sort(key=lambda wb: wb[1][0])
         for k, (wd, b) in enumerate(row):
@@ -2093,6 +2238,9 @@ def _check_struck(rows, clean, strikes, sure):
             # обрывок линии за последней цифрой читается знаком препинания: «3549:»
             while len(places) > len(pieces) and text[places[-1]] in ":;-–—_~":
                 places.pop()
+            # скобка, которой на картинке нет: «(7549.00» — обрывок линии слева
+            while len(places) > len(pieces) and text[places[0]] in "([{":
+                places.pop(0)
             unread = len(pieces) == len(places) + 1     # первый кусок не прочитан вовсе
             if not pieces or not pieces[0] or not (unread or len(pieces) == len(places)):
                 continue
@@ -2100,6 +2248,8 @@ def _check_struck(rows, clean, strikes, sure):
             expected = set(sure)
             if k and re.sub(r"[^A-Za-z]", "", row[k - 1][0]["text"]).upper() == "MRP":
                 expected.add("₹")
+            if own is None:
+                own = _own_glyphs(rows, clean, expected)
             tail = text[max(i for i, ch in enumerate(text) if ch.isdigit()) + 1:]
             after = tail or (row[k + 1][0]["text"] if k + 1 < len(row) else "")
             if expected and not _any_mark(after, "post") and (
@@ -2111,9 +2261,12 @@ def _check_struck(rows, clean, strikes, sure):
                 rare = min(d for d, is_rare, _ in ds if is_rare)
                 near, sign = min((min((d for d, _, ch in ds if ch == s), default=9.0), s)
                                  for s in expected)
+                mine = _own_sign(own, clean, pieces[0], dtop, dbottom, skip, expected,
+                                 {guess} | ({first} if first.isdigit() else set()))
                 if guess != first and digit >= _STRUCK_NOT_DIGIT \
                         and near <= min(digit + _STRUCK_NEAR[0], claim + _STRUCK_NEAR[1],
-                                        rare + _STRUCK_NEAR[2]):
+                                        rare + _STRUCK_NEAR[2]) or mine:
+                    sign = mine or sign
                     if unread:
                         text = sign + text
                         places = [i + 1 for i in places]
@@ -2136,6 +2289,16 @@ def _check_struck(rows, clean, strikes, sure):
                 elif lead >= _STRUCK_DOUBT_MARGIN:
                     wd["doubt"] = True
             wd["text"] = "".join(chars)
+            if not wd.get("doubt") and gray is not None and dh <= _STRUCK_SMALL * scale:
+                # Мелкие цифры: проверяем вторым чтением, с закрашенной линией.
+                # Целые должны совпасть — копейки второе чтение порой теряет.
+                whole = re.sub(r"\D", "", re.sub(r"[.,]\d{1,2}$", "", wd["text"]))
+                again = None
+                if rereads > 0:
+                    rereads -= 1
+                    again = _reread_struck(gray, [g for g in pieces if g], line, dtop, dbottom)
+                if not again or not again.startswith(whole):
+                    wd["doubt"] = True
 
 
 def read_lines(img, langs="eng", scale=2.0):
@@ -2231,7 +2394,7 @@ def read_lines(img, langs="eng", scale=2.0):
             wd["text"] = again
     _dollar_or_s(rows, clean)
     sure = _find_rare_signs(rows, clean, scale, langs)
-    _check_struck(rows, clean, strikes, sure)
+    _check_struck(rows, clean, strikes, sure, gray, scale)
     lines = [sorted((wd for wd, _ in ws), key=lambda w: w["box"][0]) for ws in rows.values()]
     lines.sort(key=lambda ws: (min(w["box"][1] for w in ws), ws[0]["box"][0]))
     return lines

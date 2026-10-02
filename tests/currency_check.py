@@ -198,6 +198,16 @@ CASES = [
     # раз дороже, «₹440⁰⁰» в Tahoma — «₹410.00»
     ("$19.99", "file:usd_raised_verdana.png:eng", "auto", [(19.99, "USD", False)]),
     ("2 options from ₹440.00", "file:inr_raised_tahoma.png:eng", "auto", [(440, "INR", False)]),
+    # Плитки вариантов там же при 100 %: старая цена в 11 px под линией. Знак
+    # узнаётся по мелкому «₹» из «(₹440.00 / kg)» рядом, цифры — двумя чтениями;
+    # не совпали — цену не показываем («₹1,098» читалось «₹1,092»). Часть цен
+    # без знака («1,320.00») не находится — так и было.
+    ("плитки, ряд 1", "file:inr_amazon_tiles_struck.png:eng", "auto",
+     [(880, "INR", False), (959, "INR", False), (440, "INR", False), (440, "INR", False),
+      (440, "INR", False), (479.5, "INR", False), (1647, "INR", True)]),
+    ("плитки, ряд 2", "file:inr_amazon_tiles_struck2.png:eng", "auto",
+     [(1918, "INR", False), (1149, "INR", False), (2298, "INR", False), (479.5, "INR", False),
+      (459.6, "INR", False), (459.6, "INR", False), (2196, "INR", True)]),
     # Arial из Chrome: зачёркнутая «1» читалась как «4» — выходило 4 299 рупий
     ("M.R.P.: ₹1,299", "file:inr_mrp_struck_arial.png:eng", "auto", [(1299, "INR", True)]),
     ("$19|99", "sup", "auto", [(19.99, "USD", False)]),
