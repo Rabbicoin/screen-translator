@@ -171,6 +171,17 @@ CASES = [
     ("₹132.00 (₹1,100.00 /100 g)", "file:inr_amazon.png:eng+rus", "INR",
      [(132, "INR", False), (1100, "INR", False)]),
     ("₹|132|00|(₹1,100.00 /100 g)", "amazon", "auto", [(132, "INR", False), (1100, "INR", False)]),
+    # Amazon своим шрифтом (Amazon Ember): мелкий «₹» сверху сбивал и цифры —
+    # «₹440» читалось «AAO», «₹418⁰⁰» — «%4.1» и «8°» (выходило 4,1 рупии), а
+    # «₹» в строке — цифрой: «(2440», «Upto 213.00». Слева в первом снимке —
+    # обрезок «%» от скидки: так выходит, когда цену выделяют впритык.
+    ("₹440 (₹440 / kg)", "file:inr_amazon_ember.png:eng", "auto",
+     [(440, "INR", False), (440, "INR", False)]),
+    ("₹440.00 (₹440.00 / kg)", "file:inr_amazon_ember_cents.png:eng", "auto",
+     [(440, "INR", False), (440, "INR", False)]),
+    ("₹418.00 (₹418.00 / kg)", "file:inr_amazon_ember_418.png:eng", "auto",
+     [(418, "INR", False), (418, "INR", False)]),
+    ("Upto ₹13.00", "file:inr_amazon_ember_upto.png:eng", "auto", [(13, "INR", False)]),
     ("$19|99", "sup", "auto", [(19.99, "USD", False)]),
     # Франция: знак на месте запятой, копейки мелко сверху — «19€⁹⁹»
     ("19€|99", "sup", "auto", [(19.99, "EUR", False)]),
