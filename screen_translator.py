@@ -56,7 +56,8 @@ from tkinter import font as tkfont
 from tkinter import ttk
 
 import requests
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageGrab, ImageOps, ImageStat
+from PIL import (Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageGrab,
+                 ImageOps, ImageStat)
 
 import pytesseract
 from pytesseract import Output
@@ -1646,6 +1647,25 @@ def merge_missing(primary, other, ratio):
     return added
 
 
+def _cjk_language(lines):
+    """Язык Tesseract для иероглифики, которой в основном набраны строки; иначе None.
+
+    Кана выдаёт японский, хангыль — корейский, одни иероглифы — китайский
+    упрощённый: на витринах и в инструкциях он встречается чаще прочих.
+    """
+    letters = [c for words in lines.values() for w in words for c in w["text"] if c.isalpha()]
+    cjk = [c for c in letters if _is_cjk(c)]
+    if not letters or len(cjk) < 0.5 * len(letters):
+        return None
+    kana = sum(1 for c in cjk if 0x3040 <= ord(c) <= 0x30FF)
+    hangul = sum(1 for c in cjk if 0xAC00 <= ord(c) <= 0xD7AF or 0x1100 <= ord(c) <= 0x11FF)
+    if hangul > 0.3 * len(cjk):
+        return "kor"
+    if kana > 0.1 * len(cjk):
+        return "jpn"
+    return "chi_sim"
+
+
 def _ocr_lines(img):
     """Распознанные строки: [{text, box, conf, col}], сверху вниз.
 
@@ -1718,6 +1738,20 @@ def _ocr_lines(img):
             lines, langs, best_kept = found, attempt, kept
         if kept and dropped <= max(1, kept * 0.25):
             break                      # прочитали уверенно, дальше искать нечего
+
+    # Определитель письменности ошибается и на больших снимках: китайскую
+    # витрину с фотографиями товаров он назвал латиницей с уверенностью 0.1.
+    # Тогда очередь доходит до набора из двадцати языков — он иероглифы
+    # находит, но читает хуже одного китайского: модели мешают друг другу
+    # («复购率» становилось «EMME»). Если набор из нескольких языков прочитал
+    # в основном иероглифы, пробуем язык этой письменности отдельно.
+    alone = _cjk_language(lines) if "+" in langs else None
+    if alone and alone not in candidates and alone in available_ocr_langs():
+        found, kept, dropped = read(alone)
+        log(f"иероглифы при «{langs}» — пробуем «{alone}»: прочитано {kept}, "
+            f"отброшено {dropped}")
+        if kept > best_kept:
+            lines, langs, best_kept = found, alone, kept
 
     # Увеличение картинки помогает мелкому экранному шрифту и мешает крупному:
     # на снимке таблицы размеров после апскейла пропадали все числа, оставался
@@ -2122,6 +2156,26 @@ _TALL = (set("bdfhijklt0123456789([{)]}|@#$&/\\!?%") |
          set("бёйф"))              # из строчных кириллических вверх лезут эти
 _DEEP = set("gjpqy([{)]}|@$,;/") | set("друфцщ")
 
+# Какую долю кегля занимает по высоте строка иероглифов. Замерено: у Microsoft
+# YaHei и SimSun знак выходит на 0.92–0.98 кегля, на снимке экрана после
+# сглаживания — 12–13 пикселей при шрифте в 14.
+CJK_INK_RATIO = 0.9
+
+# Во сколько раз кегль соседних строк может различаться, чтобы их ещё склеивать
+# в один абзац. У строк одного абзаца оценка гуляет на пятую часть, у значка над
+# подписью она больше вдвое-втрое.
+PARAGRAPH_FONT_SPREAD = 1.5
+
+# Чем «чужое» на картинке отличается от фона, когда перевод ищет, куда ему
+# расти. Порог — разница яркости с цветом фона: серый текст «已售1000+» (#999
+# на белом) даёт около ста, бледный разделитель #eee — меньше двадцати.
+INK_TOLERANCE = 40
+# Строка считается занятой, если в ней столько пикселей не фона: одиночная
+# точка от сжатия снимка остановить перевод не должна.
+INK_MIN_PIXELS = 2
+# Отступ перевода от найденного соседа: заливка не должна касаться его букв.
+INK_MARGIN = 2
+
 
 def _ink_ratio(text):
     """Какую долю кегля занимает чернильная рамка строки.
@@ -2155,6 +2209,15 @@ def _font_guess(text, h, w):
     крупнее соседей по сетке.
     """
     letters = max(1, len(text.strip()))
+    # Иероглиф занимает кегель почти целиком — и по высоте, и по ширине, — а
+    # латинская мерка (рамка в 0.62 кегля, буква в полкегля) завышала его в
+    # полтора раза. На китайской витрине перевод рисовался крупнее оригинала,
+    # не влезал в карточку и наползал на цену под названием. По ширине здесь
+    # мерить даже надёжнее: знаки стоят ровно по одному на кегль, а рамку
+    # строки Tesseract у иероглифов нет-нет да и раздувает на треть.
+    cjk = sum(1 for ch in text if _is_cjk(ch))
+    if cjk and cjk >= 0.5 * (letters - cjk):      # иероглифы — хоть половина ширины
+        return min(h / CJK_INK_RATIO, w / (cjk + 0.5 * (letters - cjk)))
     return min(h / _ink_ratio(text), (w / (0.5 * letters)) * 1.1)
 
 
@@ -2170,30 +2233,63 @@ def _mark_cells(lines):
     «Материал» и «Размер» сливаются в одну фразу, значения из разных строк — в
     другую, и вместо характеристик получается каша.
     """
+    def same_height(a, b):
+        ha = max(1.0, a["box"][3] - a["box"][1])
+        hb = max(1.0, b["box"][3] - b["box"][1])
+        return min(a["box"][3], b["box"][3]) - max(a["box"][1], b["box"][1]) >= 0.5 * min(ha, hb)
+
+    def fragment(line):
+        """Обрывок, лежащий внутри другой строки на той же высоте.
+
+        Второй проход разметки читает кусок уже найденной строки отдельно:
+        «50 套箱» поверх «打包盒外卖均分四格150套箱». Такой кусок — не ячейка,
+        и соседом ячейке он тоже не служит.
+        """
+        x0, x1 = line["box"][0], line["box"][2]
+        return any(o is not line and same_height(line, o)
+                   and o["box"][2] - o["box"][0] > x1 - x0
+                   and min(x1, o["box"][2]) - max(x0, o["box"][0]) >= 0.5 * (x1 - x0)
+                   for o in lines)
+
     for line in lines:
         line["cell"] = False
-    for line in lines:
+    whole = [l for l in lines if not fragment(l)]
+    for line in whole:
         x0, y0, x1, y1 = line["box"]
         h = max(1.0, y1 - y0)
-        for other in lines:
-            if other is line:
-                continue
-            ox0, oy0, ox1, oy1 = other["box"]
-            if min(y1, oy1) - max(y0, oy0) < 0.5 * min(h, max(1.0, oy1 - oy0)):
-                continue                       # не на одной высоте — не соседи
-            left, right = (line, other) if x0 <= ox0 else (other, line)
-            gap = right["box"][0] - left["box"][2]
-            # Ячейка занимает лишь малую часть своей колонки («Бренд» и дальше
-            # пусто до значения). В тексте, набранном в две колонки, строка,
-            # наоборот, заполняет колонку целиком — по этому и различаем.
-            span = max(1.0, right["box"][0] - left["box"][0])
-            fill = (left["box"][2] - left["box"][0]) / span
-            wide = gap >= 3 * h and fill <= 0.6
-            # «Количество в упаковке: 4» — подпись с двоеточием и значение
-            # рядом: тоже строка таблицы, даже если провал между ними невелик
-            labelled = gap >= 1.5 * h and left["text"].rstrip().endswith(":")
-            if wide or labelled:
-                line["cell"] = other["cell"] = True
+        # Сравниваем только с ближайшим соседом справа. Пока сверялись со всеми
+        # строками на той же высоте, в сетке карточек ячейкой выходила любая
+        # строка: до четвёртой карточки в ряду провал всегда «широкий». Две
+        # строки названия товара переставали склеиваться в абзац и переводились
+        # порознь — с ломаной грамматикой и наползая одна на другую.
+        row = [o for o in whole if o is not line and o["box"][0] >= x1 - 0.5 * h
+               and same_height(line, o)]
+        if not row:
+            continue
+        other = min(row, key=lambda o: o["box"][0])
+        gap = other["box"][0] - x1
+        # Где на самом деле кончается моя колонка, показывают строки над и под
+        # мной: последняя строка абзаца короче прочих, и провал от неё до
+        # соседней карточки обманчиво широк. Строку, перешагнувшую в колонку
+        # соседа (абзац во всю ширину под таблицей), не считаем. Смотрим только
+        # на соседние строки абзаца: подпись флажка двумя строками выше —
+        # не моя колонка, и из-за неё «Диаметр контакта  0,4 mm» переставал
+        # считаться строкой таблицы.
+        edge = max([x1] + [o["box"][2] for o in whole
+                           if abs(o["box"][1] - y0) <= 1.6 * h
+                           and o["box"][2] <= other["box"][0]
+                           and min(x1, o["box"][2]) - max(x0, o["box"][0]) > 0])
+        # Ячейка занимает лишь малую часть своей колонки («Бренд» и дальше
+        # пусто до значения). В тексте, набранном в две колонки, строка,
+        # наоборот, заполняет колонку целиком — по этому и различаем.
+        span = max(1.0, other["box"][0] - x0)
+        fill = (x1 - x0) / span
+        wide = other["box"][0] - edge >= 3 * h and fill <= 0.6
+        # «Количество в упаковке: 4» — подпись с двоеточием и значение
+        # рядом: тоже строка таблицы, даже если провал между ними невелик
+        labelled = gap >= 1.5 * h and line["text"].rstrip().endswith(":")
+        if wide or labelled:
+            line["cell"] = other["cell"] = True
     return lines
 
 
@@ -2215,7 +2311,11 @@ def _mark_reach(lines):
         # Соседи по колонке: рядом сверху/снизу и с тем же левым краем. Своей
         # считаем строку, выровненную хоть по тексту, хоть по маркеру списка:
         # переносы в списках бывают и так, и так.
-        band = [o for o in lines[max(0, i - 4):i + 5]
+        # Окно по номерам широкое: строки идут сверху вниз и слева направо, и в
+        # сетке из шести карточек строка над моей стоит на шесть позиций раньше.
+        # При окне в четыре строки соседей по колонке не находилось вовсе, и
+        # любая строка считалась «дотянувшейся до края».
+        band = [o for o in lines[max(0, i - 12):i + 13]
                 if (abs(o["text_x0"] - line["text_x0"]) <= 1.5 * h
                     or abs(o["box"][0] - x0) <= 1.5 * h)
                 and abs(o["box"][1] - y0) <= 6 * h]
@@ -2232,7 +2332,13 @@ def _mark_reach(lines):
         # перенос случается тогда и только тогда, когда оно в остаток не влезло.
         # Влезало бы — значит строку оборвали намеренно, это конец абзаца.
         char_w = (x1 - x0) / max(1, len(line["text"]))
-        line["reaches"] = right - x1 < max((len(words[0]) + 1) * char_w, 1.5 * h)
+        # В иероглифике пробелов нет, и строку переносят после любого знака:
+        # «словом», которое не влезло, служит один знак. Иначе вся следующая
+        # строка считалась одним длинным словом, любая короткая строка
+        # «дотягивалась до края», и к названию товара приклеивалась строка
+        # «复购率 36%» из-под него.
+        first = 1 if _is_cjk(words[0][0]) else len(words[0])
+        line["reaches"] = right - x1 < max((first + 1) * char_w, 1.5 * h)
         line["step"] = nxt["box"][1] - y0        # шаг до следующей строки колонки
     return lines
 
@@ -2278,6 +2384,16 @@ def _group_paragraphs(lines, typical):
                 continue                 # шаг больше обычного — это отбивка
             px0, py0, px1, py1 = prev["box"]
             avg_h = prev["h_sum"] / len(prev["lines"])
+            # Строки одного абзаца набраны одним кеглем. Значок над подписью
+            # Tesseract читает буквами («&», «Gt») и рамку даёт ростом с сам
+            # значок — без этой проверки он приклеивался к подписи под собой,
+            # и «Repair Model Hollow» переводилось как «Модель ремонта GT
+            # полая». Сравниваем кегль, а не рамку: у строки без выносных
+            # букв рамка и так вдвое ниже, чем у соседней с ними.
+            font = _font_guess(line["text"], h, x1 - x0)
+            prev_font = prev["font_sum"] / len(prev["lines"])
+            if max(font, prev_font) > PARAGRAPH_FONT_SPREAD * max(1.0, min(font, prev_font)):
+                continue
             gap = y0 - py1
             # Перенос внутри предложения терпит зазор побольше: строки одного
             # абзаца иногда стоят просторнее, чем «половина высоты буквы».
@@ -2706,7 +2822,19 @@ def is_translatable(text):
     каждый такой кусок отдельным запросом. На карточке товара с двумя десятками
     цен из этого набегало пять секунд ожидания на пустом месте.
     """
-    return sum(1 for ch in text if ch.isalpha()) >= 2 and not looks_like_code(text)
+    letters = [ch for ch in text if ch.isalpha()]
+    if len(letters) < 2 or looks_like_code(text):
+        return False
+    # Знак валюты из пары букв перед числом — это цена: «zł2.57», «R$10».
+    # Переводчик портил их: «zi2.57» (так прочитана «zł2.57») возвращалось
+    # «зи2.57», а «zł1 1.36» — «1 злотый 1,36». Единицы после числа («0.45 kg»,
+    # «20-60 mm») не трогаем: «кг» и «мм» по-русски читаются лучше. Иероглифы
+    # не в счёт: за «复购率 43%» стоит подпись «повторные покупки».
+    price = re.match(r"\D*\d", text.strip())
+    if (price and len(letters) <= 3 and not any(_is_cjk(ch) for ch in letters)
+            and not any(ch.isalpha() for ch in text.strip()[price.end():])):
+        return False
+    return True
 
 
 def looks_like_code(text):
@@ -3032,6 +3160,45 @@ def _fit_text(draw, text, box_w, box_h, start_size, min_size=8, spacing=1.25):
         size -= 1
 
 
+def _ink_counts(src, box, bg, columns=False):
+    """Сколько в каждой строке области (или в каждом столбце) пикселей не фона.
+
+    «Не фон» — всё, что заметно отличается от цвета под надписью: буквы, цена,
+    значок, край фотографии. Бледные разделители (#eee на белом) сюда не
+    попадают — их не жалко закрасить.
+    """
+    x0, y0, x1, y1 = (int(v) for v in box)
+    w, h = x1 - x0, y1 - y0
+    if w <= 0 or h <= 0:
+        return []
+    diff = ImageChops.difference(src.crop((x0, y0, x1, y1)),
+                                 Image.new("RGB", (w, h), bg)).convert("L")
+    mask = diff.point(lambda v: 255 if v > INK_TOLERANCE else 0)
+    if columns:
+        mask = mask.transpose(Image.TRANSPOSE)
+        w, h = h, w
+    data = mask.tobytes()
+    return [w - data.count(b"\x00", i * w, (i + 1) * w) for i in range(h)]
+
+
+def _clear_run(counts, own):
+    """Сколько первых строк (столбцов) свободно от чужого текста.
+
+    Первые `own` строк могут задевать хвосты собственных букв: рамка Tesseract
+    обводит их не всегда целиком, и стоять на этом нельзя — блок не рос бы
+    вовсе. Чужим считается то, что начинается после хотя бы одной пустой строки
+    или тянется дальше этих хвостов.
+    """
+    i = 0
+    while i < len(counts) and i < own and counts[i] >= INK_MIN_PIXELS:
+        i += 1
+    if i == own and i < len(counts) and counts[i] >= INK_MIN_PIXELS:
+        return 0                         # не хвосты, а сосед вплотную
+    while i < len(counts) and counts[i] < INK_MIN_PIXELS:
+        i += 1
+    return i
+
+
 def dominant_color(region):
     """Самый частый цвет области — это фон под текстом (тёмная тема, светлая, любая)."""
     small = region.resize((max(1, min(60, region.width)), max(1, min(30, region.height))))
@@ -3131,9 +3298,31 @@ def render_overlay(img, blocks, translations, zoom=None):
                     and abs(oy0 - y0) < near):
                 column_right = max(column_right, ox1)
         # Короткой подписи («Вес», «Цвет») колонка соседей всё равно мала —
-        # разрешаем ей четверть своей ширины сверх, иначе перевод такой ячейки
-        # обрезался бы многоточием на ровном месте.
-        right = min(right, max(column_right, x1 + (x1 - x0) // 4))
+        # разрешаем ей ещё свою ширину сверх, иначе перевод такой ячейки
+        # обрезался бы многоточием на ровном месте. Дальше края ячейки или
+        # кнопки она всё равно не уйдёт: его остановит проверка по пикселям
+        # ниже. Пока такой проверки не было, запас держали в четверть ширины,
+        # и «Модель продукта» в ячейке под «产品型号» ужималась вдвое при
+        # пустом месте до линии таблицы.
+        right = min(right, max(column_right, x1 + (x1 - x0)))
+        # Расти можно только на пустой фон. Соседей выше сверяли по списку
+        # найденных блоков, а того, что распознавание пропустило, в нём нет:
+        # цены «zł11.36» под названием товара, значка, края фотографии. Перевод
+        # разрастался на это место и закрашивал его — на китайской витрине
+        # пропадали цены. Поэтому смотрим на сами пиксели исходной картинки.
+        if idx < len(translations) and translations[idx].strip():
+            bg = _background_of(src.crop((x0, y0, x1, y1)))[0]
+            own = max(2, int(0.25 * (block.get("line_h") or 12)))
+            if right > x1:
+                cols = _ink_counts(src, (x1, y0, right, y1), bg, columns=True)
+                run = _clear_run(cols, own)
+                if run < len(cols):
+                    right = x1 + max(0, run - INK_MARGIN)
+            if bottom > y1:
+                rows = _ink_counts(src, (x0, y1, max(x1, right), bottom), bg)
+                run = _clear_run(rows, own)
+                if run < len(rows):
+                    bottom = y1 + max(0, run - INK_MARGIN)
         limits[idx] = (max(x1, right), max(y1, bottom))
 
     # настройки шрифта перевода — см. config.json
