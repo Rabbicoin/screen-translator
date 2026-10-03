@@ -665,6 +665,10 @@ def find_prices(lines, source="auto"):
             # и выходило 74 рупии. Запятая с пробелом и три цифры за ней.
             if code and re.match(r"(?:, | ,| , )\d{3}", norm[end:]):
                 continue
+            # Одна-две цифры и запятая в конце строки — начало оборванного числа:
+            # плитка, срезанная краем прокрутки, «₹3,59…» читалась «₹3,».
+            if re.fullmatch(r"\d{1,2}", raw) and re.fullmatch(r",\s*", norm[end:]):
+                continue
             if mult:
                 value *= mult[0]
             items.append({"start": start, "end": end, "span": (span0, span1), "code": code,
@@ -1717,6 +1721,22 @@ def _own_blobs(clean, row, k):
     return blobs
 
 
+def _dot_or_dash(rows, clean):
+    """«·» между числами распознавание читает дефисом, а дефис между числами —
+    диапазон: в «₹959 · 7959» второе число получало знак первого. Дефис на
+    картинке широкий и тонкий, точка — почти квадратная; такую черту делаем «·».
+    """
+    for row in rows.values():
+        for wd, b in row:
+            if wd["text"] not in ("-", "–", "—"):
+                continue
+            ink = _blobs(clean, b)
+            if len(ink) == 1:
+                g = ink[0]
+                if g[2] - g[0] < 1.6 * max(1, g[3] - g[1]):
+                    wd["text"] = "·"
+
+
 def _dollar_or_s(rows, clean):
     """«$» и «S» распознавание путает: «R$100» читалось «RS100» — рупии вместо
     реалов, «SG$100» — «$G$100», доллары США. Различаем по картинке: черта «$»
@@ -2055,7 +2075,7 @@ _STRUCK_NOT_DIGIT = 0.15
 # они сами путают, с перевесом до 0,02.
 _STRUCK_SWAPS = {("4", "1"), ("2", "3")}
 _STRUCK_SWAP_MARGIN = 0.015
-_STRUCK_DOUBT_MARGIN = 0.03
+_STRUCK_DOUBT_MARGIN = 0.025
 
 
 # На сколько знак со снимка должен быть ближе цифр со снимка, чтобы зачёркнутый
@@ -2384,7 +2404,11 @@ def read_lines(img, langs="eng", scale=2.0):
     ценой разбор макета читал «8s. 29.990-66», а «psm 6» — «Rs. 29,990.00».
     Однострочной полоске лучше «psm 7».
     """
-    scale = scale if img.height * scale < 4000 else 1.0
+    # Больше 4000 точек по высоте распознавание не любит. Увеличиваем, сколько
+    # влезает, а не сразу до ×1: выделение всей страницы при масштабе 150 %
+    # (2100 точек) читалось без увеличения, и из 20 цен находилась одна.
+    if img.height * scale >= 4000:
+        scale = max(1.0, min(scale, 3999 / max(1, img.height)))
     # BICUBIC, а не LANCZOS: на снимках страниц из Chrome при масштабах экрана
     # 100–150 % с ним ошибок распознавания заметно меньше
     big = img.resize((max(1, int(img.width * scale)), max(1, int(img.height * scale))),
@@ -2467,6 +2491,7 @@ def read_lines(img, langs="eng", scale=2.0):
         was, now = re.sub(r"\D", "", old), re.sub(r"\D", "", again)
         if now == was or (now == was[1:] and old[0].isdigit() and not again[0].isdigit()):
             wd["text"] = again
+    _dot_or_dash(rows, clean)
     _dollar_or_s(rows, clean)
     sure = _find_rare_signs(rows, clean, scale, langs)
     _settle_signs(rows, clean, sure)
