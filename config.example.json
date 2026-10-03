@@ -19,5 +19,6 @@
   "overlay_zoom": 1.0,
   "overlay_min_font": 8,
   "overlay_line_spacing": 1.25,
-  "overlay_uniform_font": true
+  "overlay_uniform_font": true,
+  "overlay_cjk_spread_max": 2.0
 }

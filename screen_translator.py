@@ -160,6 +160,11 @@ DEFAULT_CONFIG = {
     "overlay_min_font": 8,         # ниже не ужимаем: что не влезло, режем «…»
     "overlay_line_spacing": 1.25,  # межстрочный интервал; 1.1 экономит место
     "overlay_uniform_font": True,  # один кегль на весь текст, чтобы не прыгал
+    # Перевод с китайского (японского, корейского) втрое длиннее оригинала и в
+    # плотной вёрстке не помещается. Картинку результата тогда раздвигаем —
+    # насколько нужно, но не больше чем во столько раз; шрифт перевода остаётся
+    # как на странице, лишнее прокручивается. 1 — не раздвигать.
+    "overlay_cjk_spread_max": 2.0,
     # --- пересчёт цен (Ctrl+Alt+D), см. currency.py
     "currency_targets": [],        # в какие валюты; пусто — по языку перевода (₽ и $)
     "currency_source": "auto",     # валюта на экране: "auto" — по знаку у цены, иначе код
@@ -479,6 +484,34 @@ OTHER_PASS_BLOCK = 1000
 # превращался из одиннадцати блоков в восемьдесят два, среди них «ct» и «mm».
 # Поэтому psm 4 идёт вторым проходом, и из него берутся только пропажи.
 SECOND_LAYOUT_PSM = 4
+
+# Разметки на случай, когда и основная, и проверочная не нашли почти ничего:
+# одним блоком строк и разрозненные надписи. См. _ocr_lines.
+FALLBACK_PSMS = (6, 11)
+
+# Радиус размытия для выравнивания фона (в пикселях исходного снимка): заметно
+# шире штриха буквы, но уже плашки. Замерено на витрине сервисов: при 8 штрихи
+# крупного заголовка частично уходили в «фон», при 15 читалось вдвое больше.
+FLATTEN_RADIUS = 15
+
+# Значок-плашка, прочитанный как буква (синий квадрат с белой «Z» Tesseract
+# читает как «园»), залит плотно и отличается цветом от букв своей строки.
+# Замерено на исходных пикселях: у значков доля чернил 0.69–0.85, но и у
+# иероглифов в тесной рамке она доходит до 0.77 («需»), поэтому одной
+# плотности мало. Цвет — по оттенку, без яркости: синий значок от серого
+# текста отличается на двести с лишним по сумме каналов, чёрное от серого — на ноль.
+ICON_INK = 0.6
+ICON_COLOR_GAP = 120
+# Уверенность, ниже которой иероглиф в начале строки считаем значком: «✦»
+# читался «人» на 19, «从» на 27, а настоящие «数码» — на 44, прочие — от 60.
+CJK_ICON_CONF = 40
+
+# На сколько пикселей соседний блок должен зайти в рамку снизу, чтобы рамку
+# подрезать. Касание на отступ (по два пикселя у каждой рамки) — норма.
+OVERLAP_CLIP_PX = 6
+
+# Наименьший простор, если перевод с иероглифов в снимок не влезает. См. _cjk_spread.
+CJK_SPREAD_MIN = 1.5
 
 # Насколько проход без увеличения должен опередить основной, чтобы его заменить.
 # Небольшого перевеса мало: на скане инструкции содержимое поделено между
@@ -1493,6 +1526,25 @@ def preprocess(img, scale):
     return img
 
 
+def flatten_background(img, scale):
+    """Штрихи букв без фона: тёмным по белому, какими бы ни были фон и буквы.
+
+    Из снимка вычитаем его же сильно размытую копию — остаётся только то, что
+    резко отличается от окружения, то есть штрихи. Плашки, градиенты и шапки
+    сайта уходят в ровный фон, а белые буквы на синем становятся тёмными, как
+    и прочие. Нужно для запасного прохода: синяя шапка с узором над витриной
+    сервисов сбивала разбор макета, и Tesseract не находил на снимке ни
+    одного слова; на снимке с выровненным фоном — семьдесят с лишним.
+    """
+    gray = img.convert("L")
+    if scale and scale != 1.0:
+        gray = gray.resize((max(1, int(gray.width * scale)), max(1, int(gray.height * scale))),
+                           Image.LANCZOS)
+    blur = gray.filter(ImageFilter.MedianFilter(3)).filter(
+        ImageFilter.GaussianBlur(FLATTEN_RADIUS * (scale or 1.0)))
+    return ImageOps.invert(ImageOps.autocontrast(ImageChops.difference(gray, blur)))
+
+
 def _column_gaps(words, width, min_gap):
     """Сквозные вертикальные «рвы» — пустые полосы между колонками и карточками.
 
@@ -1672,7 +1724,7 @@ def _ocr_lines(img):
     Строку режем на части там, где между словами большой горизонтальный провал —
     иначе текст из соседних колонок (карточек) склеивается в одну кашу.
     """
-    scale = float(CFG.get("ocr_scale", 2.0) or 1.0)
+    scale = cfg_scale = float(CFG.get("ocr_scale", 2.0) or 1.0)
     # для однострочных полосок psm 7 (одна строка) точнее, чем разметка страницы
     psm = 7 if img.height < 40 else int(CFG.get("tesseract_psm", 3))
     prepared = preprocess(img, scale)
@@ -1794,10 +1846,64 @@ def _ocr_lines(img):
     # шапки — при 1.08 Мпикс проход шёл, при 0.91 уже нет. Человек видит не
     # «порог», а то, что программа работает через раз. Однострочной полоске
     # (psm 7) проверка не нужна: там разбирать нечего.
+    main_kept = sum(len(v) for v in lines.values())
     if psm not in (7, SECOND_LAYOUT_PSM):
         other, kept, _ = read(langs, SECOND_LAYOUT_PSM)
         log(f"разметка «psm {SECOND_LAYOUT_PSM}»: прочитано {kept}, добавлено слов "
             f"{merge_missing(lines, other, 1.0)}")
+
+    # Бывает, что разбор макета не находит на снимке почти ничего. Витрина
+    # сервисов на китайском сайте — плитки «значок и две строки» под синей
+    # шапкой с узором: «psm 3» прочитал там ноль слов, «psm 4» — тринадцать, а
+    # текста на снимке больше сотни знаков. Тогда пробуем разметки, которые
+    # макет не разбирают вовсе: «psm 6» читает снимок одним блоком строк, «psm
+    # 11» ищет разрозненные надписи. Ведущим становится тот, кто прочитал
+    # больше, остальное добирается склейкой. В обычных случаях сюда не доходит.
+    #
+    # Язык тут тоже под вопросом: раз основной проход не прочитал ничего ни
+    # одним набором, проверить догадку определителя было не на чем — витрину
+    # он назвал корейской, и корейская модель читала мусор. Поэтому для
+    # иероглифики сначала читаем всеми её языками сразу, по прочитанному
+    # выбираем один и читаем им. Без увеличения «psm 6» здесь читал втрое
+    # больше, чем с ним; «psm 11» — наоборот.
+    if psm != 7 and main_kept < TOO_FEW_WORDS:
+        have = available_ocr_langs()
+        fallback = langs
+        cjk_set = "+".join(l for l in CJK_LANGS if l in have)
+        if cjk_set and (LAST_SCRIPT in CJK_SCRIPTS or set(langs.split("+")) & set(CJK_LANGS)):
+            fallback = cjk_set
+        kept_now, lines_now, scale_now, prepared_now = (
+            sum(len(v) for v in lines.values()), lines, scale, prepared)
+        prepared = preprocess(img, 1.0)
+        block_read, block_kept, _ = read(fallback, FALLBACK_PSMS[0])
+        alone = _cjk_language(block_read) if fallback == cjk_set and "+" in fallback else None
+        if alone and alone in have:
+            fallback = alone
+            block_read, block_kept, _ = read(fallback, FALLBACK_PSMS[0])
+        native = prepared
+        # Обычная разметка, но по снимку с выровненным фоном: шапка сайта и
+        # плашки уходят в ровный белый и перестают сбивать разбор макета.
+        prepared = flatten_background(img, cfg_scale)
+        flat_read, flat_kept, _ = read(fallback)
+        prepared = preprocess(img, cfg_scale) if cfg_scale != 1.0 else native
+        sparse_read, sparse_kept, _ = read(fallback, FALLBACK_PSMS[1])
+        log(f"разметка почти ничего не нашла ({main_kept} слов), «{fallback}»: "
+            f"«psm {FALLBACK_PSMS[0]}» прочитано {block_kept}, по выровненному "
+            f"фону — {flat_kept}, «psm {FALLBACK_PSMS[1]}» — {sparse_kept}")
+        # Ведёт сплошное чтение: разрозненное находит больше, но и мусора
+        # в нём больше («AAA;», значки буквами). Уступает, только если отстаёт
+        # заметно. Остальные проходы добирают то, чего у ведущего нет: на
+        # витрине сервисов сплошное чтение теряет вторую строку подписей, а
+        # чтение по выровненному фону её находит.
+        passes = sorted([(block_kept / 0.6, block_read, 1.0, native),
+                         (flat_kept, flat_read, cfg_scale, prepared),
+                         (sparse_kept, sparse_read, cfg_scale, prepared)],
+                        key=lambda p: -p[0])
+        if max(block_kept, flat_kept, sparse_kept) > kept_now:
+            _, lines, scale, prepared = passes[0]
+            langs = fallback
+            for _, other, other_scale, _ in passes[1:] + [(0, lines_now, scale_now, None)]:
+                merge_missing(lines, other, scale / other_scale)
 
     # Второй проход: узкий набор языков поверх выбранного. Нужен только на
     # смешанном тексте — там смешанный набор путает кириллицу с латиницей.
@@ -1845,9 +1951,131 @@ def _ocr_lines(img):
     cyrillic_page = bool(page_letters) and sum(
         1 for c in page_letters if "\u0400" <= c <= "\u04FF") > len(page_letters) / 2
 
+    source = img.convert("RGB")
+
+    def ink_of(word):
+        """Чернила слова на исходном снимке: (их доля в рамке, сколько их, средний цвет)."""
+        x0, y0 = int(word["x0"] / scale), int(word["y0"] / scale)
+        x1, y1 = int(-(-word["x1"] // scale)), int(-(-word["y1"] // scale))
+        if x1 - x0 < 3 or y1 - y0 < 3:
+            return 0.0, 0, (0, 0, 0)
+        bg = _background_of(source.crop((max(0, x0 - 2), max(0, y0 - 2),
+                                         min(source.width, x1 + 2),
+                                         min(source.height, y1 + 2))))[0]
+        inner = source.crop((x0, y0, x1, y1))
+        mask = ImageChops.difference(inner, Image.new("RGB", inner.size, bg)).convert(
+            "L").point(lambda v: 255 if v > INK_TOLERANCE else 0)
+        count = mask.tobytes().count(b"\xff")
+        if not count:
+            return 0.0, 0, (0, 0, 0)
+        color = tuple(ImageStat.Stat(inner, mask).mean)
+        return count / ((x1 - x0) * (y1 - y0)), count, color
+
+    def icons(words):
+        """Значки, прочитанные как иероглиф или знак: «园» вместо синего квадрата с «Z».
+
+        Одной плотности мало: у иероглифа в тесной рамке она тоже доходит до
+        трёх четвертей. Значок выдаёт ещё и цвет — синяя плашка среди серых и
+        чёрных букв строки. Цифры и латиницу не трогаем: рамка жирной «1» тоже
+        почти вся залита. Плоское слово — тоже не значок: «一» — одна черта.
+        """
+        short = [w for w in words
+                 if w["text"].strip() and len(w["text"].strip()) <= 2
+                 and not any(c.isascii() and c.isalnum() for c in w["text"])
+                 and 0.6 <= (w["x1"] - w["x0"]) / max(1, w["y1"] - w["y0"]) <= 1.6]
+        if not short or len(words) < 2:
+            return set()
+        stats = {id(w): ink_of(w) for w in words}
+        found = set()
+        for w in short:
+            density, _, color = stats[id(w)]
+            if density < ICON_INK:
+                continue
+            rest = [stats[id(o)] for o in words if o is not w and stats[id(o)][1]]
+            total = sum(n for _, n, _ in rest)
+            if not total:
+                continue
+            ref = [sum(n * c[i] for _, n, c in rest) / total for i in range(3)]
+            # Сравниваем оттенок, а не яркость: жирное чёрное «精选货源» среди
+            # серых пунктов меню по яркости тоже «другого цвета», но оба серые.
+            # Синий значок от серых букв отличается именно цветом.
+            hue = [c - sum(color) / 3 for c in color]
+            ref_hue = [c - sum(ref) / 3 for c in ref]
+            if sum(abs(hue[i] - ref_hue[i]) for i in range(3)) >= ICON_COLOR_GAP:
+                found.add(id(w))
+        return found
+
+    prepared_rgb = prepared.convert("RGB")
+
+    def tighten(words):
+        """Поджимаем рамки слов к полосе букв своей строки.
+
+        Рамку Tesseract раздувает: на витрине сервисов рамка заголовка плитки
+        захватывала верх подписи под ним, а рамка подписи — низ заголовка.
+        Заливка одного блока резала буквы другого пополам, а подрезка
+        налезающих рамок оставляла недокрашенную полоску. По пикселям строки
+        видно, где на самом деле её буквы: самая плотная полоса, отделённая
+        от чужих пустыми рядами. Слово, чьи чернила почти все в этой полосе,
+        к ней и поджимаем. Полосу ищем по всей строке, а не по слову: у «三»
+        между чертами тоже пусто, но соседние знаки строки эти ряды заполняют.
+        Считаем только под самими словами: значки соседних плиток стоят между
+        ними во всю высоту плитки и залили бы пустые ряды.
+        """
+        x0, y0 = min(w["x0"] for w in words), min(w["y0"] for w in words)
+        x1, y1 = max(w["x1"] for w in words), max(w["y1"] for w in words)
+        if y1 - y0 < 8 or x1 - x0 < 4:
+            return
+        bg = _background_of(prepared_rgb.crop((x0, y0, x1, y1)))[0]
+        rows = [0] * (y1 - y0)
+        for w in words:
+            for i, n in enumerate(_ink_counts(prepared_rgb, (w["x0"], y0, w["x1"], y1), bg)):
+                rows[i] += n
+        gap_min = max(3, int(0.15 * (y1 - y0)))
+        runs, start, blank = [], None, 0
+        for i, n in enumerate(rows + [0] * gap_min):
+            if n >= INK_MIN_PIXELS:
+                if start is None:
+                    start = i
+                blank, end = 0, i
+            elif start is not None:
+                blank += 1
+                if blank >= gap_min:
+                    runs.append((start, end, sum(rows[start:end + 1])))
+                    start = None
+        # Одна полоса — тоже поджимаем: пустые поля рамки раздувают и оценку
+        # кегля, и заливку, которая потом накрывает соседей.
+        if not runs:
+            return
+        top, bottom, _ = max(runs, key=lambda r: r[2])
+        band0, band1 = y0 + top - 1, y0 + bottom + 2
+        for w in words:
+            own = _ink_counts(prepared_rgb, (w["x0"], w["y0"], w["x1"], w["y1"]), bg)
+            total = sum(own)
+            inside = sum(n for i, n in enumerate(own) if band0 <= w["y0"] + i < band1)
+            if total and inside >= 0.7 * total:
+                w["y0"], w["y1"] = max(w["y0"], band0), min(w["y1"], band1)
+
     out = []
     for key, words in lines.items():
         words.sort(key=lambda w: w["x0"])
+        # Значок в строке опасен дважды: в переводе выходит «Парк «Тендерный
+        # запрос» (значок прочитан «园 “»), а стоящий между колонками значок
+        # перекидывает мостик через провал — и подписи двух соседних плиток
+        # склеиваются в одну строку.
+        skip = icons(words)
+        if skip:
+            log("значки вместо букв: " + " ".join(w["text"] for w in words if id(w) in skip))
+        words = [w for w in words if id(w) not in skip] or words
+        tighten(words)
+        # Одиночный знак препинания посреди провала — тоже мостик: кавычка «”»
+        # на месте значка соединила две подписи через пустое место. Настоящую
+        # запятую или тире от слов отделяет обычный пробел, не шире буквы.
+        line_h = sorted(w["y1"] - w["y0"] for w in words)[len(words) // 2]
+        words = [w for i, w in enumerate(words)
+                 if not (0 < i < len(words) - 1
+                         and not any(c.isalnum() for c in w["text"])
+                         and w["x0"] - words[i - 1]["x1"] > 0.8 * line_h
+                         and words[i + 1]["x0"] - w["x1"] > 0.8 * line_h)]
         height = max(w["y1"] - w["y0"] for w in words)
         row = band_gaps(min(w["y0"] for w in words), max(w["y1"] for w in words))
         segments, current = [], [words[0]]
@@ -2126,6 +2354,14 @@ def _strip_leading_icon(seg):
         unsure = head["conf"] < 65 and not any(ch.isalpha() for ch in text)
         taller = head["y1"] - head["y0"] > 1.3 * tall
         far = gap > max(2.0 * max(1.0, typical), 0.4 * tall)
+        if any(_is_cjk(ch) for ch in text):
+            # У иероглифов рамка обводит сам знак, а не кегельную площадку:
+            # промежуток после «恤» или «纸» выходит шире «обычного», рамки
+            # пляшут по высоте — и признаки отрыва и роста срезали настоящее
+            # начало строки: «深圳市», «容量», «纺织». Значок, прочитанный
+            # иероглифом, выдаёт неуверенность: «✦» как «人» — 19, а настоящие
+            # знаки от 44. Синие плашки ловит проверка по цвету (icons).
+            unsure, taller, far = head["conf"] < CJK_ICON_CONF, False, False
         if not (unsure or taller or far):
             break
         seg = rest
@@ -3209,11 +3445,13 @@ def dominant_color(region):
     return max(colors)[1]
 
 
-def render_overlay(img, blocks, translations, zoom=None):
+def render_overlay(img, blocks, translations, zoom=None, spread=None):
     """Закрашиваем исходный текст и пишем поверх перевод.
 
     `zoom` перебивает настройку `overlay_zoom` — так кнопки 1× / 1.5× / 2×
-    в окне результата пересобирают ту же картинку крупнее.
+    в окне результата пересобирают ту же картинку крупнее. `spread` —
+    простор: картинка крупнее при прежнем кегле перевода; None — решить самим
+    (нужен переводу с иероглифов, см. _cjk_spread), 1 — не раздвигать.
 
     Четыре прохода, и порядок принципиален:
       1. считаем, сколько места есть у каждого блока и какой кегль он просит;
@@ -3224,37 +3462,173 @@ def render_overlay(img, blocks, translations, zoom=None):
     хвост текста верхнего, и слово выглядело обрезанным.
     """
     src = img.convert("RGB")
+    blocks = _clip_overlaps(blocks)
+
+    # настройки шрифта перевода — см. config.json
+    scale = _clamp(CFG.get("overlay_font_scale", 1.0), 0.5, 3.0, 1.0)
+    min_font = int(_clamp(CFG.get("overlay_min_font", 8), 6, 40, 8))
+    spacing = _clamp(CFG.get("overlay_line_spacing", 1.25), 1.0, 2.0, 1.25)
+    uniform = bool(CFG.get("overlay_uniform_font", True))
 
     # Увеличение всего оверлея. Кегль относительно блока при этом не меняется,
     # зато результат становится читаемым при любой вёрстке — в отличие от
     # overlay_font_scale, который упирается в высоту исходного блока.
     # Рисуем сразу в увеличенном разрешении, иначе текст вышел бы мыльным.
     zoom = _clamp(CFG.get("overlay_zoom", 1.0) if zoom is None else zoom, 1.0, 3.0, 1.0)
-    if zoom > 1.001:
-        src = src.resize((max(1, int(src.width * zoom)), max(1, int(src.height * zoom))),
+    # Простор — то же увеличение, но без кегля: картинка крупнее, а шрифт
+    # перевода прежний, и места под него становится больше. Нужен переводу с
+    # иероглифов, см. _cjk_spread. Вместе с увеличением — не больше чем вчетверо.
+    if spread is None:
+        spread = _cjk_spread(src, blocks, translations, scale, min_font, spacing)
+    spread = max(1.0, min(spread, 4.0 / zoom))
+    k = zoom * spread
+    if k > 1.001:
+        src = src.resize((max(1, int(src.width * k)), max(1, int(src.height * k))),
                          Image.LANCZOS)
         blocks = [dict(b,
-                       bbox=tuple(int(v * zoom) for v in b["bbox"]),
-                       line_h=b.get("line_h", 10) * zoom,
+                       bbox=tuple(int(v * k) for v in b["bbox"]),
+                       line_h=b.get("line_h", 10) * k,
                        font_h=b.get("font_h", b.get("line_h", 10)) * zoom,
-                       col_right=int(b.get("col_right", img.width) * zoom))
+                       col_right=int(b.get("col_right", img.width) * k))
                   for b in blocks]
 
     base_h = src.height
+    src = _padded(src)
+    out = src.copy()
+    draw = ImageDraw.Draw(out)
+    limits = _overlay_limits(src, blocks, translations)
 
-    # У нижних блоков под перевод почти нет места: он длиннее оригинала, а сразу
-    # под ним — край выделения. Такой блок ужимался до нечитаемого и тянул за
-    # собой общий кегль всей картинки. Наращиваем холст, лишнее срежем в конце.
+    # --- проход 1: место под блок и запрошенный им кегль
+    plans = []
+    for idx, (block, translated) in enumerate(zip(blocks, translations)):
+        if not translated.strip():
+            continue
+        x0, y0, x1, y1 = block["bbox"]
+        w, h = x1 - x0, y1 - y0
+        if w < 8 or h < 6:
+            continue
+        max_right, max_bottom = limits.get(idx, (src.width, src.height))
+
+        # Ориентир — кегль оригинала, посчитанный с поправкой на выносные
+        # буквы. По голой рамке строки он выходил тем меньше, чем «ровнее»
+        # набрана строка, и перевод почти всегда получался мельче исходного.
+        own_h = block.get("font_h") or block.get("line_h",
+                                                 h / max(1, block.get("lines", 1)))
+        # Без запаса вниз: оценка кегля и так выходит на пару пунктов меньше
+        # исходной (Tesseract обводит буквы, а не кегельную площадку), и лишний
+        # коэффициент делал перевод мельче оригинала уже на этом шаге. Если
+        # перевод не влезет — его ужмёт _fit_text, для того он и есть.
+        start_size = max(min_font, int(round(own_h * scale)))
+        avail_w = max(40, max_right - x0 - 2)
+        avail_h = max(h, max_bottom - y0)
+        plans.append({"box": (x0, y0, x1, y1), "text": translated, "start": start_size,
+                      "avail": (avail_w, avail_h), "limit": (max_right, max_bottom),
+                      "size": start_size})
+    if not plans:
+        return out.crop((0, 0, out.width, base_h))
+    return _layout_and_draw(src, out, draw, plans, base_h, min_font, spacing, uniform)
+
+
+def _padded(src):
+    """Холст с запасом снизу; лишнее срежет отрисовка.
+
+    У нижних блоков под перевод почти нет места: он длиннее оригинала, а сразу
+    под ним — край выделения. Такой блок ужимался до нечитаемого и тянул за
+    собой общий кегль всей картинки.
+    """
+    base_h = src.height
     pad = min(400, max(48, base_h // 2))
     tail = dominant_color(src.crop((0, max(0, base_h - 8), src.width, base_h)))
     grown = Image.new("RGB", (src.width, base_h + pad), tail)
     grown.paste(src, (0, 0))
-    src = grown
-    out = src.copy()
-    draw = ImageDraw.Draw(out)
+    return grown
 
-    # русский текст обычно длиннее оригинала, поэтому блоку разрешено
-    # разрастись вправо и вниз — но не залезая на соседей (колонки, карточки)
+
+def _clip_overlaps(blocks):
+    """Подрезаем рамку, в нижнюю половину которой заходит соседний блок.
+
+    Рамку строки раздувает значок рядом с ней: у «失信被执行人» она вобрала
+    плашку слева и вдвое выросла вниз, накрыв подпись «查失信，规避合作风险».
+    Сосед снизу останавливает только рост за рамку, а саму рамку блок
+    закрашивал и заполнял целиком — переводы двух блоков ложились друг на
+    друга. Обычное касание рамок на отступ в пару пикселей не трогаем.
+    """
+    out = []
+    for i, block in enumerate(blocks):
+        x0, y0, x1, y1 = block["bbox"]
+        cut = y1
+        for j, other in enumerate(blocks):
+            if j == i:
+                continue
+            ox0, oy0, ox1, oy1 = other["bbox"]
+            if (min(x1, ox1) > max(x0, ox0) and y0 + 0.5 * (y1 - y0) <= oy0
+                    and y1 - oy0 > OVERLAP_CLIP_PX and oy0 + oy1 > y0 + y1):
+                cut = min(cut, oy0)
+        out.append(block if cut == y1 else dict(block, bbox=(x0, y0, x1, cut)))
+    return out
+
+
+def _mostly_cjk(text):
+    letters = [c for c in text if c.isalpha()]
+    return bool(letters) and sum(1 for c in letters if _is_cjk(c)) >= 0.5 * len(letters)
+
+
+def _cjk_spread(src, blocks, translations, scale, min_font, spacing):
+    """Во сколько раз раздвинуть картинку, чтобы перевод с иероглифов влез шрифтом оригинала.
+
+    Перевод с китайского по ширине втрое длиннее оригинала: на витрине сервисов
+    подпись «批量导出企业风险明细数据» в 150 пикселей становится фразой в 330,
+    а места рядом — плитка соседа. Ужимать кегль до восьми пикселей и резать
+    многоточием — нечитаемо. Поэтому картинку результата увеличиваем, а шрифт
+    перевода оставляем как на странице: места под него становится больше, а
+    лишнее окно прокручивает.
+
+    Насколько — считаем: сколько места просит перевод кеглем оригинала и
+    сколько ему есть. Берём не самый тесный блок, а четыре пятых: один
+    случайный обрывок не должен раздувать весь снимок. Влезает и так — не
+    раздвигаем вовсе. Только для иероглифики: русский после английского или
+    немецкого длиннее на четверть, там хватает и подбора кегля.
+    """
+    limit = _clamp(CFG.get("overlay_cjk_spread_max", 2.0), 1.0, 3.0, 2.0)
+    target = str(CFG.get("target_lang", "ru") or "").lower().split("-")[0]
+    if limit <= 1.0 or target in ("zh", "ja", "ko"):
+        return 1.0
+    drawn = [i for i, t in enumerate(translations[:len(blocks)]) if t.strip()]
+    cjk = [i for i in drawn if _mostly_cjk(blocks[i]["text"])]
+    if not cjk or len(cjk) < 0.5 * len(drawn):
+        return 1.0
+    grown = _padded(src)
+    limits = _overlay_limits(grown, blocks, translations)
+    probe = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    need = []
+    for i in cjk:
+        block, text = blocks[i], translations[i]
+        x0, y0, x1, y1 = block["bbox"]
+        max_right, max_bottom = limits.get(i, (grown.width, grown.height))
+        room = max(1, max_right - x0 - 2) * max(1, y1 - y0, max_bottom - y0)
+        own = block.get("font_h") or block.get("line_h", 12)
+        size = max(min_font, int(round(own * scale)))
+        width = probe.textlength(text, font=_font(size, text))
+        # перенос по словам теряет конец каждой строки — запас в шестую часть
+        need.append(width * size * spacing * 1.15 / room)
+    need.sort()
+    spread = need[int(0.8 * (len(need) - 1))] ** 0.5
+    log(f"простор для перевода с иероглифов: нужно ×{spread:.2f}, предел ×{limit:.1f}")
+    if spread < 1.1:
+        return 1.0
+    # Раз уж тесно — раздвигаем не меньше чем в полтора раза: расчёт берёт
+    # кегль оригинала и не знает, что перевод в шесть строк по восемь
+    # пикселей «влезает», но не читается. Просьба пользователя была такой
+    # же: «было 300 пикселей — сделать 500».
+    return min(max(spread, CJK_SPREAD_MIN), limit)
+
+
+def _overlay_limits(src, blocks, translations):
+    """До куда каждому блоку можно разрастись: {номер: (правый край, нижний край)}.
+
+    Русский текст обычно длиннее оригинала, поэтому блоку разрешено разрастись
+    вправо и вниз — но не залезая на соседей (колонки, карточки).
+    """
     limits = {}
     for idx, block in enumerate(blocks):
         x0, y0, x1, y1 = block["bbox"]
@@ -3289,7 +3663,10 @@ def render_overlay(img, blocks, translations, zoom=None):
             # соседом считаем и того, кто начинается чуть выше моего низа.
             if (oy0 >= y1 - 0.3 * (y1 - y0) and oy0 > y0
                     and min(x1, ox1) > max(x0, ox0)):
-                bottom = min(bottom, oy0 - 1)
+                # Край заливки — до самого соседа: нижняя граница не входит в
+                # заливку, и при «oy0 - 1» между блоками оставалась полоска в
+                # пиксель, где из-под перевода выглядывали хвосты букв.
+                bottom = min(bottom, oy0)
             # Сосед сверху или снизу в той же колонке. У крайней карточки соседа
             # справа нет вовсе, и без этого признака перевод вылезал за её край
             # на пустое поле. Где кончается колонка, показывает самая длинная
@@ -3324,42 +3701,11 @@ def render_overlay(img, blocks, translations, zoom=None):
                 if run < len(rows):
                     bottom = y1 + max(0, run - INK_MARGIN)
         limits[idx] = (max(x1, right), max(y1, bottom))
+    return limits
 
-    # настройки шрифта перевода — см. config.json
-    scale = _clamp(CFG.get("overlay_font_scale", 1.0), 0.5, 3.0, 1.0)
-    min_font = int(_clamp(CFG.get("overlay_min_font", 8), 6, 40, 8))
-    spacing = _clamp(CFG.get("overlay_line_spacing", 1.25), 1.0, 2.0, 1.25)
-    uniform = bool(CFG.get("overlay_uniform_font", True))
 
-    # --- проход 1: место под блок и запрошенный им кегль
-    plans = []
-    for idx, (block, translated) in enumerate(zip(blocks, translations)):
-        if not translated.strip():
-            continue
-        x0, y0, x1, y1 = block["bbox"]
-        w, h = x1 - x0, y1 - y0
-        if w < 8 or h < 6:
-            continue
-        max_right, max_bottom = limits.get(idx, (src.width, src.height))
-
-        # Ориентир — кегль оригинала, посчитанный с поправкой на выносные
-        # буквы. По голой рамке строки он выходил тем меньше, чем «ровнее»
-        # набрана строка, и перевод почти всегда получался мельче исходного.
-        own_h = block.get("font_h") or block.get("line_h",
-                                                 h / max(1, block.get("lines", 1)))
-        # Без запаса вниз: оценка кегля и так выходит на пару пунктов меньше
-        # исходной (Tesseract обводит буквы, а не кегельную площадку), и лишний
-        # коэффициент делал перевод мельче оригинала уже на этом шаге. Если
-        # перевод не влезет — его ужмёт _fit_text, для того он и есть.
-        start_size = max(min_font, int(round(own_h * scale)))
-        avail_w = max(40, max_right - x0 - 2)
-        avail_h = max(h, max_bottom - y0)
-        plans.append({"box": (x0, y0, x1, y1), "text": translated, "start": start_size,
-                      "avail": (avail_w, avail_h), "limit": (max_right, max_bottom),
-                      "size": start_size})
-    if not plans:
-        return out.crop((0, 0, out.width, base_h))
-
+def _layout_and_draw(src, out, draw, plans, base_h, min_font, spacing, uniform):
+    """Проходы 2–4 из render_overlay: общий кегль, раскладка строк, заливка и текст."""
     # --- проход 2: кегль по классам текста.
     # Блоки разбиты по кеглю оригинала: подписи, тело, заголовки. Общий кегль на
     # всех означал, что самый тесный блок мельчит весь снимок, — поэтому классы
