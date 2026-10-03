@@ -59,6 +59,14 @@ CASES = [
     (price("z", "440", "00"), [], "neg"),
     ("с 9" + UP.format("00") + " до 18" + UP.format("00"), [], "neg"),
     (price("№", "12", "34"), [], "neg"),
+    # mid — цена посреди фразы, как на sevdev.ru: знак в рост, копейки сверху, за
+    # ними запятая или точка. Запятая обрывала поиск копеек: «$19⁹⁹,» -> $19
+    ("вида $19⁹⁹, где", [(19.99, "USD")], "mid"),
+    ("от $19<sup>99</sup>, а", [(19.99, "USD")], "mid"),
+    ("всего $199⁹⁹.", [(199.99, "USD")], "mid"),
+    ("за €24⁹⁹, но", [(24.99, "EUR")], "mid"),
+    ("цена $200⁰⁰.", [(200, "USD")], "mid"),
+    ("like $19⁹⁹, so", [(19.99, "USD")], "mid"),
 ]
 VARIANTS = [(f, s, d) for f in ("Arial", "Segoe UI", "Verdana", "Tahoma", "Georgia", "Trebuchet MS")
             for s in (16, 18, 21, 28) for d in (1.0, 1.25, 1.5)]
@@ -113,7 +121,8 @@ def work(job):
     img = Image.open(png).convert("RGB")
     crop = img.crop(tuple(int(round(v * dpr)) for v in (
         c * CELL_W, r * CELL_H, c * CELL_W + CELL_W - 8, r * CELL_H + CELL_H)))
-    lines = _ST.read_lines(crop, "eng", 2.0)
+    # фразы по-русски программа читает с русским, как выбрала бы price_ocr_langs
+    lines = _ST.read_lines(crop, "eng+rus" if group == "mid" else "eng", 2.0)
     got = [[round(p.amount, 6), p.code] for p in _ST.find_prices(lines)]
     want = [[round(a, 6), cd] for a, cd in want]
     return {"i": i, "html": html, "group": group, "got": got, "want": want, "ok": got == want,
@@ -132,7 +141,7 @@ def load(name):
 
 def compare(a, b):
     old = {(r["variant"], r["i"]): r for r in load(a)}
-    new = load(b)
+    new = [r for r in load(b) if (r["variant"], r["i"]) in old]   # новые случаи — не с чем сравнить
     fixed = [r for r in new if r["ok"] and not old[(r["variant"], r["i"])]["ok"]]
     broke = [r for r in new if not r["ok"] and old[(r["variant"], r["i"])]["ok"]]
     worse = [r for r in new if wrong(r) and not wrong(old[(r["variant"], r["i"])])]
@@ -156,7 +165,7 @@ def main():
         res = list(ex.map(work, jobs, chunksize=8))
     json.dump(res, open(os.path.join(HERE, f"bench_raised_{name}.json"), "w", encoding="utf-8"),
               ensure_ascii=False, indent=0)
-    for g in ("inr", "inr0", "oth", "rare", "neg"):
+    for g in ("inr", "inr0", "oth", "rare", "neg", "mid"):
         rs = [r for r in res if r["group"] == g]
         print(f"  {g:4} {sum(r['ok'] for r in rs):4} / {len(rs)}")
     bad = [r for r in res if wrong(r)]

@@ -27,6 +27,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import xml.etree.ElementTree as ET
 import zlib
 
@@ -942,7 +943,7 @@ def _halo_row(halo, w, y, x0, x1):
 
 
 def _raised_tail(gray, box):
-    """Копейки, набранные мелко сверху («$19⁹⁹»): где они начинаются по x, или None.
+    """Копейки, набранные мелко сверху («$19⁹⁹»): их рамка (x0, y0, x1, y1) или None.
 
     Делим слово на знаки по пустым столбцам и смотрим на низ каждого. Обычные
     цифры стоят на одной линии, копейки висят выше неё. Распознавание их то
@@ -976,16 +977,46 @@ def _raised_tail(gray, box):
         return None
     base = sorted(g[3] for g in glyphs)[len(glyphs) // 2]
     tall = max(g[3] - g[2] for g in glyphs)
+    # Рост цифр — по знакам, стоящим на общей линии. По самому высокому знаку
+    # мерить нельзя: «$» в Verdana выше цифр на треть и свисает ниже строки, и
+    # висящие копейки рядом с ним не казались висящими.
+    dig = max((g[3] - g[2] for g in glyphs if abs(g[3] - base) <= 0.1 * tall), default=tall)
+    # Цена посреди фразы: «$19⁹⁹, где центы…» — запятая (точка) входит в слово
+    # и стоит последней. Она внизу строки, а не сверху, и с неё поиск копеек
+    # сразу обрывался: выходило «$19». Мелкий знак внизу строки пропускаем.
+    while len(glyphs) > 3 and glyphs[-1][2] >= base - 0.35 * dig \
+            and glyphs[-1][3] - glyphs[-1][2] < 0.5 * dig \
+            and glyphs[-1][1] - glyphs[-1][0] < 0.4 * dig:
+        glyphs.pop()
     tail = []
     for g in reversed(glyphs):
         # висит: низ заметно выше общей линии, и сам знак мельче обычной цифры
-        if g[3] < base - 0.3 * tall and (g[3] - g[2]) < 0.8 * tall:
+        if g[3] < base - 0.3 * dig and (g[3] - g[2]) < 0.8 * tall:
             tail.append(g)
         else:
             break
     if not tail or len(tail) == len(glyphs):
         return None
-    return x0 + tail[-1][0]
+    return (x0 + tail[-1][0], y0 + min(g[2] for g in tail),
+            x0 + tail[0][1] + 1, y0 + max(g[3] for g in tail) + 1)
+
+
+def _whole_digits(gray, box, x_cents, prefix):
+    """Сколько цифр в рост стоит перед копейками сверху (`x_cents`) — по картинке.
+
+    Распознавание то пишет копейки вплотную к числу («$1999», а то и «$1977»),
+    то теряет их («$199,»), то теряет и цифру числа. По тексту, какие цифры
+    свои, не понять: «$199,» с отрезанными «99» стало бы «$1.99». Считаем знаки
+    в рост и вычитаем знак валюты (`prefix` — что прочитано перед цифрами).
+    """
+    pieces = _blobs(gray, (box[0], box[1], x_cents, box[3]))
+    tall = max((p[3] - p[1] for p in pieces), default=0)
+    # точки и запятые между разрядами не считаем; слипшиеся цифры — две
+    count = sum(2 if p[2] - p[0] >= 1.05 * (p[3] - p[1]) else 1
+                for p in pieces if p[3] - p[1] >= 0.4 * tall)
+    # знак, прочитанный не тем («©» вместо «€», «*» вместо мелкого «₹»), — тоже
+    # знак; точки, запятые, кавычки и черточки мельче, их и в кусках не считали
+    return count - sum(1 for ch in prefix if not ch.isspace() and ch not in ".,:;'‘’\"`´·-–—_")
 
 
 def _read_digits(gray, box, seps=False):
@@ -1559,6 +1590,43 @@ def _settle_digit(read, best):
     return None
 
 
+def _settle_cents(clean, tail, cents=None, strict=True):
+    """Копейки сверху по их кускам `tail` -> '99' или None, если не разобрать.
+
+    `cents` — уже прочитанные вместе с числом; нет — читаем отдельно. Сверяем
+    с картинкой: цифр столько же, сколько нарисовано, и каждая похожа на себя.
+    Одна цифра из двух («⁹⁹» -> «9») — не копейки: «$19⁹⁹» стало бы «$1.90».
+
+    Не `strict` — где образцы спорят с прочитанным, верим прочитанному. Так для
+    цены посреди фразы: «⁹» из знаков Юникода в Arial рисуется чужим шрифтом,
+    и образцы принимают её за «8». Ошибка в копейках — меньше единицы, а без
+    копеек «$1999» осталось бы в сто раз дороже.
+    """
+    ncents = _cents_count(tail)
+    top, bottom = min(g[1] for g in tail), max(g[3] for g in tail)
+    if cents is None:
+        # _read_cents берёт верхние три четверти рамки — рамку строим от самих копеек
+        cents = _read_cents(clean, tail[0][0], (tail[0][0], max(0, top - 1), tail[-1][2],
+                                                top + int((bottom - top + 2) / 0.75) + 1))
+    if not strict and cents and len(cents) == len(tail):
+        ncents = len(tail)              # широкий круглый «⁰» в Georgia — не две слипшиеся
+    if ncents == len(tail):
+        dists = [_digit_dists(clean, g, top, bottom) for g in tail]
+        guess = "".join(min(best, key=best.get) for best in dists)
+        if cents and len(cents) == ncents:
+            # мелкий «0» образцы принимают за «8» — тут верим прочитанному
+            fixed = [r if (r, t) == ("0", "8") else _settle_digit(r, best) or (None if strict else r)
+                     for r, t, best in zip(cents, guess, dists)]
+            cents = None if None in fixed else "".join(fixed)
+        elif cents and cents in guess:
+            cents = guess                   # прочитана одна цифра из двух — вторая по образцам
+        else:
+            cents = None
+    elif not cents or len(cents) != ncents:
+        cents = None
+    return cents
+
+
 # Знаки, которые пишут перед числом и у валют которых есть копейки: только такой
 # знак бывает в начале цены «мелкий знак — цифры — мелкие копейки»
 _PRICE_SIGNS = "$€£¥₹₪₱฿₺"
@@ -1644,25 +1712,7 @@ def _raised_number(clean, body, covered, raised, dtop, dbottom, langs, may_rerea
         return None, all(g[2] - g[0] < 1.15 * dh for g in run), reread
     if not tail:
         return whole, False, reread
-    top, bottom = min(g[1] for g in tail), max(g[3] for g in tail)
-    if cents is None:
-        # _read_cents берёт верхние три четверти рамки — рамку строим от самих копеек
-        cents = _read_cents(clean, tail[0][0], (tail[0][0], max(0, top - 1), tail[-1][2],
-                                                top + int((bottom - top + 2) / 0.75) + 1))
-    if ncents == len(tail):
-        dists = [_digit_dists(clean, g, top, bottom) for g in tail]
-        guess = "".join(min(best, key=best.get) for best in dists)
-        if cents and len(cents) == ncents:
-            # мелкий «0» образцы принимают за «8» — тут верим прочитанному
-            fixed = [r if (r, t) == ("0", "8") else _settle_digit(r, best)
-                     for r, t, best in zip(cents, guess, dists)]
-            cents = None if None in fixed else "".join(fixed)
-        elif cents and cents in guess:
-            cents = guess                   # прочитана одна цифра из двух — вторая по образцам
-        else:
-            cents = None
-    elif not cents or len(cents) != ncents:
-        cents = None
+    cents = _settle_cents(clean, tail, cents)
     if cents is None:
         # копейки не разобрать: у сотен и тысяч без них можно, у «19⁹⁹» — нельзя
         if len(re.sub(r"\D", "", whole)) >= 3:
@@ -2453,10 +2503,18 @@ def read_lines(img, langs="eng", scale=2.0):
                      and y + 0.25 * h <= sy0 <= y + 0.8 * h
                      for sx0, sx1, sy0, _ in strikes)
         if re.search(r"\d", word) and not re.search(r"\d[.,]\d", word):
-            tail_x = _raised_tail(clean, box)
-            if tail_x is not None:
-                cents = _read_cents(clean, tail_x, box)
-                if cents:
+            tail = _raised_tail(clean, box)
+            # Копейки читаем по их собственным кускам, как в _raised_number: в
+            # рамке от роста слова мелкие «⁹⁹» при 100 % читались «93», и
+            # сверяем с образцами. Справа — только до конца копеек: запятая за
+            # ними читалась бы цифрой.
+            pieces = _blobs(clean, tail) if tail is not None else []
+            if pieces:
+                cents = _settle_cents(clean, pieces, strict=False)
+                # Копеек всегда две цифры. Одна — это обрывок: вторую «⁹»
+                # распознавание унесло в соседнее слово, или это не копейки
+                # вовсе, а старинная цифра Georgia, свисающая над строкой.
+                if cents and len(cents) == 2:
                     head = re.match(r"^(\D*)(\d+)", word)
                     if head:
                         digits = head.group(2)
@@ -2465,9 +2523,12 @@ def read_lines(img, langs="eng", scale=2.0):
                         # нет: «299€⁹⁹» — это 299,99, а не «2.99»
                         sign = _marker_after(word[head.end():].translate(_NORM), 0)
                         sign = sign[0] if sign and not sign[0][0].isalnum() else ""
-                        if not sign and digits.endswith(cents) and len(digits) > len(cents):
-                            digits = digits[:-len(cents)]
-                        word = f"{head.group(1)}{digits}.{cents.ljust(2, '0')}{sign}"
+                        # лишние цифры сверх нарисованных в рост — это копейки,
+                        # прочитанные вплотную к числу: «$1999», «$1977», «$199»
+                        n = _whole_digits(clean, box, tail[0], head.group(1))
+                        if not sign and 1 <= n < len(digits) <= n + len(cents):
+                            digits = digits[:n]
+                        word = f"{head.group(1)}{digits}.{cents}{sign}"
         row.append(({"text": word, "conf": conf, "strike": strike,
                      "box": tuple(int(round(v / scale)) for v in box)}, box))
     # Мелкая старая цена в одной строке с крупной новой: распознавание
