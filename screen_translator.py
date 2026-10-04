@@ -1751,7 +1751,11 @@ def _cjk_language(lines):
     return "chi_sim"
 
 
-def _ocr_lines(img):
+class _ZhHint(Exception):
+    """Первая попытка Tesseract не прочла заметную часть надписей — похоже на иероглифы."""
+
+
+def _ocr_lines(img, zh_check=False):
     """Распознанные строки: [{text, box, conf, col}], сверху вниз.
 
     Строку режем на части там, где между словами большой горизонтальный провал —
@@ -1819,6 +1823,15 @@ def _ocr_lines(img):
     for attempt in candidates:
         found, kept, dropped = read(attempt)
         log(f"«{attempt}»: прочитано {kept}, отброшено {dropped}")
+        # Определитель письменности уверенно назвал список категорий китайского
+        # сайта латиницей (3.3 при пороге 1.5), и иероглифы читались как
+        # «RETR» и «TSS / PRISE». Выдаёт это первая же попытка: на латинице
+        # и кириллице Tesseract не может прочесть от силы двадцатую часть
+        # слов, на иероглифах, принятых за латиницу, — половину. Тогда сразу
+        # отдаём снимок китайскому пакету, не тратя время на прочие попытки.
+        if (zh_check and attempt == candidates[0] and kept + dropped
+                and dropped >= ZH_DROP_SHARE * (kept + dropped)):
+            raise _ZhHint()
         if kept > best_kept:
             lines, langs, best_kept = found, attempt, kept
         if kept and dropped <= max(1, kept * 0.25):
@@ -2752,6 +2765,10 @@ ZH_READ_TIMEOUT = 60
 # Куски одной строки, разрезанной пакетом, склеиваем, если между ними не больше
 # стольких высот строки. Соседние карточки витрины стоят через три-четыре.
 ZH_JOIN_GAP = 1.2
+# Какую долю слов первая попытка Tesseract должна не прочесть, чтобы снимок
+# отдали китайскому пакету вопреки определителю письменности. Замерено: на
+# латинице и кириллице 0–5 %, на иероглифах, принятых за латиницу, 47–56 %.
+ZH_DROP_SHARE = 0.25
 
 
 class ZhOcr:
@@ -3053,13 +3070,25 @@ def _zh_lines(img):
 
 def ocr_blocks(img):
     """Распознаём область и возвращаем (полный_текст, [абзацы с координатами])."""
-    found = None
+    found, asked = None, False
+    auto = str(CFG.get("ocr_langs", "auto") or "auto").strip().lower() == "auto"
     if ZhOcr.installed() and _zh_wanted(img):
+        asked = True
         try:
             found = _zh_lines(img)
         except Exception as e:
             log(f"китайский пакет не сработал ({e}) — читаем Tesseract-ом")
-    lines, gaps, langs = found or _ocr_lines(img)
+    if found is None:
+        try:
+            found = _ocr_lines(img, zh_check=auto and not asked and ZhOcr.installed())
+        except _ZhHint:
+            log("Tesseract не читает половину надписей — пробуем китайский пакет")
+            try:
+                found = _zh_lines(img)
+            except Exception as e:
+                log(f"китайский пакет не сработал ({e})")
+            found = found or _ocr_lines(img)
+    lines, gaps, langs = found
     source = img.convert("RGB")
     for line in lines:
         _, count, color = _ink_stats(source, line["box"])
