@@ -503,6 +503,20 @@ SECOND_LAYOUT_PSM = 4
 # одним блоком строк и разрозненные надписи. См. _ocr_lines.
 FALLBACK_PSMS = (6, 11)
 
+# Слово из букв с уверенностью ниже этой — след сломанной строки: полосу
+# вокруг него перечитываем разреженной разметкой, см. _ocr_lines. Порог тот
+# же, с какого строка считается мусором (looks_like_text). Полос — не больше
+# стольких: каждая стоит отдельного прохода Tesseract.
+GARBLED_CONF = 45
+GARBLED_BANDS_MAX = 4
+# Во сколько раз рамка неуверенного слова должна быть шире своей высоты, чтобы
+# считать его следом сломанной строки, а не значком: у «Sete» и «Tan» на месте
+# «Strawberry Sorbet» — 5, у значка, прочитанного «ERA», — меньше 3.
+GARBLED_SHAPE = 2.5
+# Из перечитанной полосы берём слова не ниже этой уверенности: «Strawberry»
+# там читается на 96, значки буквами — на 40–55.
+GARBLED_SURE = 60
+
 # Радиус размытия для выравнивания фона (в пикселях исходного снимка): заметно
 # шире штриха буквы, но уже плашки. Замерено на витрине сервисов: при 8 штрихи
 # крупного заголовка частично уходили в «фон», при 15 читалось вдвое больше.
@@ -1578,6 +1592,175 @@ def flatten_background(img, scale):
     return ImageOps.invert(ImageOps.autocontrast(ImageChops.difference(gray, blur)))
 
 
+# Тонкие линии — рамки плиток, линейки таблиц, разделители — стираем до
+# распознавания. Пунктирная рамка плитки варианта на Amazon Tesseract-у хуже
+# любой картинки: вертикальный пунктир он читает буквами («if i», «| |»,
+# «I i“»), и они мостиком соединяют подписи соседних плиток в одну строку;
+# горизонтальный пунктир под словом склеивается с ним в один знак —
+# «Strawberry» читалось как «laine» с уверенностью 9, «(Pack» как «rifBack»; а
+# плитки с одной строкой текста («Birthday Cake», «Vanilla») разбор макета не
+# находил вовсе. Без рамок на том же снимке прочиталось всё, слово в слово.
+#
+# Линия — полоса не фона длиной от RULE_MIN_LEN и толщиной до RULE_MAX_THICK
+# (двухпиксельная рамка при масштабе экрана 150 % — три пикселя), над и под
+# которой пусто; пунктир — та же полоса с разрывами до RULE_MAX_GAP. Штрих
+# буквы короче, иероглиф «一» и тире — тоже (при кегле, где они дотянут до
+# сорока, их штрих уже толще трёх). Зачёркнутая цена не страдает: над и под её
+# чертой стоят цифры, а не пусто. Скруглённые углы рамки выходят в соседние
+# ряды — по краям линии на RULE_CORNER их не считаем, а саму дугу угла стираем
+# потом: она лежит в квадрате между концом горизонтальной линии и концом
+# вертикальной, и текста там не бывает. Оставить её нельзя: дуга в шесть
+# пикселей читается как «ъ» или «*» с уверенностью 88, а остатки углов
+# сбивают разбор макета так, что пропадает соседняя строка целиком.
+RULE_MIN_LEN = 40
+RULE_MAX_GAP = 4
+# Насколько линия должна отличаться от фона. Порог ниже, чем у чернил букв
+# (INK_TOLERANCE): линейка под шапкой плитки на Amazon — #d8d8d8 на белом, на
+# 39 от фона, и как «чернила» не проходила, а как разметка она нужна — без
+# неё цена под шапкой считалась её переносом: «(Pack of 2) $7.58».
+RULE_TOLERANCE = 20
+RULE_MAX_THICK = 3
+RULE_FILL = 0.3              # доля чернил на длине линии: у пунктира — больше половины
+RULE_CLEAR = 0.15            # доля чернил в соседних рядах, при которой это ещё линия
+RULE_CORNER = 6
+RULE_CORNER_WINDOW = 12      # px: дальше друг от друга концы линий углом не считаем
+RULE_ASPECT_ACROSS = 20      # длина к толщине: горизонтальная линия, см. _erase_rows
+RULE_ASPECT_DOWN = 12        # ...и вертикальная: рамка плитки в две строки текста
+
+_RULE_RUN = re.compile(rb"\xff(?:\x00{0,%d}\xff)+" % RULE_MAX_GAP)
+
+
+def _erase_rows(img, rows, width, height, aspect, bg):
+    """Стираем горизонтальные линии прямо в img и в маске rows (байты, 0/255).
+
+    Линия должна быть длиннее своей толщины в «aspect» раз: трёхпиксельная
+    полоса в сорок пикселей — ещё не линия, если это горизонтальный штрих
+    («一» или тире крупным кеглем), а вот вертикальных штрихов такой длины и
+    толщины у букв не бывает, зато бывает рамка выбранной плитки высотой в
+    две строки — поэтому для вертикальных линий требование мягче.
+
+    Возвращает концы стёртых линий: (x, y, сторона, толщина), сторона −1 у
+    левого конца и +1 у правого, y — верхний ряд линии.
+    """
+    ends = []
+
+    def ink(y, x0, x1):
+        if y < 0 or y >= height:
+            return 0
+        return rows.count(b"\xff", y * width + x0, y * width + x1)
+
+    for y in range(height):
+        for m in _RULE_RUN.finditer(rows, y * width, (y + 1) * width):
+            x0, x1 = m.start() - y * width, m.end() - y * width
+            length = x1 - x0
+            if length < RULE_MIN_LEN or m.group().count(b"\xff") < RULE_FILL * length:
+                continue
+            thick = 1
+            while thick < RULE_MAX_THICK and ink(y + thick, x0, x1) >= 0.5 * length:
+                thick += 1
+            if length < aspect * thick:
+                continue
+            m0, m1 = x0 + RULE_CORNER, x1 - RULE_CORNER
+            clear = RULE_CLEAR * (m1 - m0)
+            if (ink(y - 1, m0, m1) > clear or ink(y - 2, m0, m1) > clear
+                    or ink(y + thick, m0, m1) > clear or ink(y + thick + 1, m0, m1) > clear):
+                continue
+            # На место линии — ряд над ней: это местный фон, какой бы он ни был.
+            # Кроме чернил: у концов линии в соседнем ряду лежит дуга угла, и
+            # она копировалась на место линии — остаток угла вырастал втрое.
+            donor = y - 1 if y > 0 else y + thick
+            if donor >= height:
+                continue
+            strip = img.crop((x0, donor, x1, donor + 1))
+            stain, first = strip.load(), donor * width
+            x = rows.find(b"\xff", first + x0, first + x1)
+            while x >= 0:
+                stain[x - first - x0, 0] = bg
+                x = rows.find(b"\xff", x + 1, first + x1)
+            for r in range(y, min(height, y + thick)):
+                img.paste(strip, (x0, r))
+                rows[r * width + x0:r * width + x1] = b"\x00" * length
+            ends.append((x0, y, -1, thick))
+            ends.append((x1 - 1, y, 1, thick))
+    return ends
+
+
+def _erase_corners(img, rows, bg, across, down):
+    """Стираем дуги углов: квадрат у наружного угла рамки, где сходятся конец
+    горизонтальной линии и конец вертикальной, заливаем тем, что снаружи.
+
+    Квадрат — со стороной в радиус скругления плюс толщина линии: дуга
+    начинается там, где кончается прямая, а конец прямой распознаётся на
+    несколько пикселей раньше или позже самого угла. Текст в этот квадрат не
+    попадает: от рамки его отделяет отступ не меньше.
+    """
+    width, height = img.size
+    px = img.load()
+    for hx, hy, side, hthick in across:
+        for vx, vy, _, vthick in down:
+            if abs(hx - vx) > RULE_CORNER_WINDOW or abs(hy - vy) > RULE_CORNER_WINDOW:
+                continue
+            size = RULE_CORNER + max(hthick, vthick)
+            if side < 0:                              # левый угол: наружный край — vx
+                x0, x1, donor = vx, vx + size, vx - 1
+            else:
+                x0, x1, donor = vx + vthick - size, vx + vthick, vx + vthick
+            if vy > hy:                               # верхний угол: наружный край — hy
+                y0, y1 = hy, hy + size
+            else:
+                y0, y1 = hy + hthick - size, hy + hthick
+            for y in range(max(0, y0), min(height, y1)):
+                fill = bg
+                if 0 <= donor < width and not rows[y * width + donor]:
+                    fill = px[donor, y]
+                for x in range(max(0, x0), min(width, x1)):
+                    px[x, y] = fill
+
+
+def erase_rules(img):
+    """Снимок без тонких линий: рамок, линеек, разделителей (см. выше)."""
+    src = img.convert("RGB")
+    bg = dominant_color(src)
+    mask = ImageChops.difference(src, Image.new("RGB", src.size, bg)).convert("L").point(
+        lambda v: 255 if v > RULE_TOLERANCE else 0)
+    width, height = src.size
+    rows = bytearray(mask.tobytes())
+    across = _erase_rows(src, rows, width, height, RULE_ASPECT_ACROSS, bg)
+    # вертикальные линии — те же горизонтальные на повёрнутом снимке
+    cols = bytearray(Image.frombytes("L", (width, height), bytes(rows))
+                     .transpose(Image.TRANSPOSE).tobytes())
+    turned = src.transpose(Image.TRANSPOSE)
+    down = [(y, x, side, thick) for x, y, side, thick
+            in _erase_rows(turned, cols, height, width, RULE_ASPECT_DOWN, bg)]
+    rules = {"across": [], "down": []}
+    if not across and not down:
+        return src, rules
+    src = turned.transpose(Image.TRANSPOSE)
+    rows = bytearray(Image.frombytes("L", (height, width), bytes(cols))
+                     .transpose(Image.TRANSPOSE).tobytes())
+    _erase_corners(src, rows, bg, across, down)
+    # Стёртые линии — ещё и разметка: рамка между плитками делит строку на
+    # две подписи, линейка под шапкой плитки отделяет её от цены (см.
+    # _ruled_apart). Концы идут парами: левый и правый одной линии.
+    rules["across"] = [(a[0], b[0] + 1, a[1], a[3]) for a, b in zip(across[::2], across[1::2])]
+    rules["down"] = [(a[1], b[1] + 1, a[0], a[3]) for a, b in zip(down[::2], down[1::2])]
+    log(f"стёрто линий: {len(rules['across'])} горизонтальных, {len(rules['down'])} вертикальных")
+    return src, rules
+
+
+def _ruled_apart(rules, a, b):
+    """Между рамками a и b (x0, y0, x1, y1) лежит стёртая горизонтальная линия,
+    накрывающая обе хотя бы наполовину: это разные элементы, не абзац."""
+    top, bottom = (a, b) if a[1] <= b[1] else (b, a)
+    for x0, x1, y, _ in rules.get("across", ()):
+        if not top[3] - 1 <= y <= bottom[1] + 1:
+            continue
+        if all(min(x1, box[2]) - max(x0, box[0]) >= 0.5 * (box[2] - box[0])
+               for box in (a, b)):
+            return True
+    return False
+
+
 def _column_gaps(words, width, min_gap):
     """Сквозные вертикальные «рвы» — пустые полосы между колонками и карточками.
 
@@ -1709,26 +1892,56 @@ def merge_missing(primary, other, ratio):
     таблицы рубашки из-за этого двоились «Length», «XL» и «Unit: cm.».
     """
     busy = [w for words in primary.values() for w in words]
+    home_of = {id(w): words for words in primary.values() for w in words}
+    doomed = set()                     # вытесненные слова ведущего прохода
     added = 0
     for key, words in list(other.items()):
-        moved = []
+        moved, home = [], None
         for word in words:
             x0, y0 = round(word["x0"] * ratio), round(word["y0"] * ratio)
             x1, y1 = round(word["x1"] * ratio), round(word["y1"] * ratio)
             area = max(1, (x1 - x0) * (y1 - y0))
-            covered, shield = 0, 0.0
+            covered, shield, hits = 0, 0.0, []
             for seen in busy:
                 dx = min(x1, seen["x1"]) - max(x0, seen["x0"])
                 dy = min(y1, seen["y1"]) - max(y0, seen["y0"])
-                if dx > 0 and dy > 0:
+                if dx > 0 and dy > 0 and id(seen) not in doomed:
+                    hits.append(seen)
                     covered += dx * dy
                     shield = max(shield, seen["conf"])
-            if (covered <= MERGE_OVERLAP * area
-                    or shield + SHIELD_CONF_GAP < word["conf"]):
+            if covered <= MERGE_OVERLAP * area:
                 moved.append(dict(word, x0=x0, y0=y0, x1=x1, y1=y1))
-        if moved:
-            primary[(key[0] + OTHER_PASS_BLOCK, key[1], key[2])] = moved
+            elif shield < GARBLED_CONF and shield + SHIELD_CONF_GAP < word["conf"]:
+                # Место занято мусором («Sete» на 24), а прочитано на 93:
+                # уверенное чтение мусор вытесняет, а не ложится рядом — иначе
+                # оба выходили отдельными блоками. Встаёт оно в строку
+                # вытесненного, и туда же — остальные слова этой строки
+                # второго прохода: в своей строке они рвали бы абзац ведущего
+                # прохода на куски («Если» отдельно от «знака нет…»), а
+                # «Strawberry» отрывалось от «Sorbet &». Слово, прочитанное
+                # ведущим проходом сносно, не трогаем: по одной уверенности
+                # не отличить, кто прав, — «Чжаоси» на 70 менялось на «Чжасси»
+                # с 96.
+                doomed.update(id(seen) for seen in hits)
+                home = home_of[id(hits[0])]
+                moved.append(dict(word, x0=x0, y0=y0, x1=x1, y1=y1))
+        if moved and home is not None:
+            home.extend(moved)
             added += len(moved)
+        elif moved:
+            # Номер сдвигаем, пока не найдём свободный: склеек бывает
+            # несколько (psm 4, полосы psm 11), и одинаковые номера блоков
+            # из разных проходов затирали бы друг друга.
+            key = (key[0] + OTHER_PASS_BLOCK, key[1], key[2])
+            while key in primary:
+                key = (key[0] + OTHER_PASS_BLOCK, key[1], key[2])
+            primary[key] = moved
+            added += len(moved)
+    if doomed:
+        for key in list(primary):
+            primary[key] = [w for w in primary[key] if id(w) not in doomed]
+            if not primary[key]:
+                del primary[key]
     return added
 
 
@@ -1764,6 +1977,10 @@ def _ocr_lines(img, zh_check=False):
     scale = cfg_scale = float(CFG.get("ocr_scale", 2.0) or 1.0)
     # для однострочных полосок psm 7 (одна строка) точнее, чем разметка страницы
     psm = 7 if img.height < 40 else int(CFG.get("tesseract_psm", 3))
+    # Исходные пиксели — для цвета букв и значков; читаем же снимок без рамок
+    # и линеек, см. erase_rules.
+    source = img.convert("RGB")
+    img, rules = erase_rules(source)
     prepared = preprocess(img, scale)
 
     def read(langs, mode=None):
@@ -1778,6 +1995,7 @@ def _ocr_lines(img, zh_check=False):
             raise RuntimeError(f"Tesseract не смог прочитать языки «{langs}». "
                                f"Проверьте, что они установлены.")
         found, weak, dropped = {}, {}, 0
+        read.garbled = []
         for i in range(len(data["text"])):
             word = (data["text"][i] or "").strip()
             try:
@@ -1790,6 +2008,12 @@ def _ocr_lines(img, zh_check=False):
             x, y, w, h = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
             box = {"x0": x, "y0": y, "x1": x + w, "y1": y + h,
                    "text": word, "conf": conf}
+            # Слово из букв, прочитанное неуверенно, — след сломанной строки,
+            # см. перечитывание полос ниже. Рамка должна быть вытянутой, как у
+            # слова: значок, прочитанный тремя буквами, почти квадратный.
+            if (conf < GARBLED_CONF and sum(c.isalpha() for c in word) >= 3
+                    and w >= GARBLED_SHAPE * h):
+                read.garbled.append(box)
             if conf >= 40:
                 found.setdefault(key, []).append(box)
             elif conf >= 10:
@@ -1819,7 +2043,7 @@ def _ocr_lines(img, zh_check=False):
     # пробуем наборы по очереди и берём тот, что прочитал больше слов. Много
     # отброшенных слов — признак, что там текст на неохваченной письменности.
     candidates = ocr_lang_candidates(prepared)
-    lines, langs, best_kept = {}, candidates[0], -1
+    lines, langs, best_kept, garbled = {}, candidates[0], -1, []
     for attempt in candidates:
         found, kept, dropped = read(attempt)
         log(f"«{attempt}»: прочитано {kept}, отброшено {dropped}")
@@ -1833,7 +2057,7 @@ def _ocr_lines(img, zh_check=False):
                 and dropped >= ZH_DROP_SHARE * (kept + dropped)):
             raise _ZhHint()
         if kept > best_kept:
-            lines, langs, best_kept = found, attempt, kept
+            lines, langs, best_kept, garbled = found, attempt, kept, read.garbled
         if kept and dropped <= max(1, kept * 0.25):
             break                      # прочитали уверенно, дальше искать нечего
 
@@ -1849,7 +2073,7 @@ def _ocr_lines(img, zh_check=False):
         log(f"иероглифы при «{langs}» — пробуем «{alone}»: прочитано {kept}, "
             f"отброшено {dropped}")
         if kept > best_kept:
-            lines, langs, best_kept = found, alone, kept
+            lines, langs, best_kept, garbled = found, alone, kept, read.garbled
 
     # Увеличение картинки помогает мелкому экранному шрифту и мешает крупному:
     # на снимке таблицы размеров после апскейла пропадали все числа, оставался
@@ -1872,7 +2096,7 @@ def _ocr_lines(img, zh_check=False):
             if kept > best_kept * NATIVE_SCALE_MARGIN:
                 # Увеличение развалило разметку: ведём по исходному размеру, а
                 # добираем из увеличенного.
-                lines, native, scale = native, lines, 1.0
+                lines, native, scale, garbled = native, lines, 1.0, read.garbled
                 ratio = 1.0 / full
             else:
                 prepared, ratio = upscaled, full
@@ -1947,9 +2171,46 @@ def _ocr_lines(img, zh_check=False):
                         key=lambda p: -p[0])
         if max(block_kept, flat_kept, sparse_kept) > kept_now:
             _, lines, scale, prepared = passes[0]
-            langs = fallback
+            langs, garbled = fallback, []
             for _, other, other_scale, _ in passes[1:] + [(0, lines_now, scale_now, None)]:
                 merge_missing(lines, other, scale / other_scale)
+
+    # Разбор макета сливает в одну строку подписи соседних плиток, если их
+    # строки перекрываются по высоте: двухстрочная «Strawberry Sorbet &» и
+    # однострочная «Sweet Mint» по центру соседней плитки. Базовая линия у
+    # такой «строки» ломаная, и левая половина читается мусором — «Tan» (0),
+    # «Sete» (24), — хотя те же пиксели сами по себе читаются на 96. Полосу
+    # вокруг такого слова перечитываем разреженной разметкой (psm 11): она не
+    # тянет строки через всю ширину и каждую надпись читает отдельно. Только
+    # полосу, не весь снимок: на связном тексте psm 11 плодит обрывки, а
+    # склейка и так берёт из него лишь то, чего в ведущем проходе нет или что
+    # прочитано там заметно хуже (см. merge_missing).
+    bands = []
+    for w in sorted(garbled, key=lambda w: w["y0"]):
+        h = w["y1"] - w["y0"]
+        lo, hi = max(0, w["y0"] - h), min(prepared.height, w["y1"] + h)
+        if bands and lo <= bands[-1][1]:
+            bands[-1][1] = max(bands[-1][1], hi)
+        else:
+            bands.append([lo, hi])
+    if bands and psm != 7:
+        whole, added = prepared, 0
+        for lo, hi in bands[:GARBLED_BANDS_MAX]:
+            prepared = whole.crop((0, lo, whole.width, hi))
+            other, _, _ = read(langs, FALLBACK_PSMS[1])
+            # Разреженная разметка читает буквами и значки; на пустое место
+            # берём из неё только уверенно прочитанное — остальное пусть
+            # остаётся за ведущим проходом (вытеснить его слово и так можно
+            # лишь с большим отрывом в уверенности, см. merge_missing)
+            for key in list(other):
+                other[key] = [dict(w, y0=w["y0"] + lo, y1=w["y1"] + lo)
+                              for w in other[key] if w["conf"] >= GARBLED_SURE]
+                if not other[key]:
+                    del other[key]
+            added += merge_missing(lines, other, 1.0)
+        prepared = whole
+        log(f"полос с неуверенными словами: {len(bands)}, перечитано "
+            f"{min(len(bands), GARBLED_BANDS_MAX)}, добавлено слов {added}")
 
     # Второй проход: узкий набор языков поверх выбранного. Нужен только на
     # смешанном тексте — там смешанный набор путает кириллицу с латиницей.
@@ -1975,20 +2236,39 @@ def _ocr_lines(img, zh_check=False):
     # строки ищем рвы заново, но только по её же полосе — там мешать некому.
     band_cache = {}
 
-    def band_gaps(y0, y1):
-        key = (int(y0), int(y1))
+    def band_gaps(y0, y1, own_h):
+        key = (int(y0), int(y1), int(own_h))
         if key not in band_cache:
-            # берём не только саму строку, но и пару строк выше и ниже: иначе
+            # берём не только саму строку, но и соседние сверху и снизу: иначе
             # обычный пробел между словами оказывается «рвом» — над ним и под
-            # ним в своей же строке пусто, и строка резалась на куски
-            lo, hi = y0 - 2.5 * median_h, y1 + 2.5 * median_h
+            # ним в своей же строке пусто, и строка резалась на куски. Но
+            # только ближайшие: при полосе в две-три строки над рядом плиток
+            # «Birthday Cake» и «Coconut» оказывалась подпись во всю ширину
+            # («Flavor Name: …»), она перекрывала ров между плитками, и две
+            # подписи склеивались в одну.
+            lo, hi = y0 - 1.5 * median_h, y1 + 1.5 * median_h
             band = [w for w in all_words if w["y1"] > lo and w["y0"] < hi]
-            other_row = any(min(y1, w["y1"]) <= max(y0, w["y0"]) for w in band)
+            # Соседняя строка — та, что не на нашей высоте; задеть нашу рамку
+            # на пиксель-другой ей не возбраняется: подпись плитки «Sweet Mint»
+            # и строка «Pomegranate Raspberry» под ней перекрывались на один
+            # пиксель, соседей «не находилось», и две подписи плиток
+            # («Sweet Mint», «Vanilla») читались одной строкой.
+            other_row = any(min(y1, w["y1"]) - max(y0, w["y0"])
+                            < 0.5 * min(y1 - y0, w["y1"] - w["y0"]) for w in band)
             # ров в полосе должен быть заметно шире межсловного пробела и
             # отступа от маркера списка, иначе от пункта отрывается его буллит
-            band_cache[key] = (_column_gaps(band, prepared.width,
-                                            max(min_gap, int(1.5 * median_h)))
-                               if len(band) > 1 and other_row else [])
+            if len(band) > 1 and other_row:
+                band_cache[key] = _column_gaps(band, prepared.width,
+                                               max(min_gap, int(1.5 * median_h)))
+            else:
+                # Строка сама по себе, соседей рядом нет: меню сайта («Home
+                # Shop Collections»), вкладки, шапка. Тогда ров — широкий
+                # промежуток в ней самой, но мерить его по медиане страницы
+                # нельзя: крупный заголовок среди мелкого текста резался бы по
+                # каждому пробелу. Мерим по росту её же букв: пункты меню стоят
+                # через полтора-три роста, слова внутри пункта — через треть.
+                band_cache[key] = _column_gaps(band, prepared.width,
+                                               max(min_gap, int(1.5 * own_h)))
         return band_cache[key]
 
     # Какой письменности на снимке больше: по ней решается, какие слова из
@@ -1996,8 +2276,6 @@ def _ocr_lines(img, zh_check=False):
     page_letters = [c for w in all_words for c in w["text"] if c.isalpha()]
     cyrillic_page = bool(page_letters) and sum(
         1 for c in page_letters if "\u0400" <= c <= "\u04FF") > len(page_letters) / 2
-
-    source = img.convert("RGB")
 
     def ink_of(word):
         """Чернила слова на исходном снимке: рамка Tesseract — в масштабе прохода."""
@@ -2108,13 +2386,20 @@ def _ocr_lines(img, zh_check=False):
                          and w["x0"] - words[i - 1]["x1"] > 0.8 * line_h
                          and words[i + 1]["x0"] - w["x1"] > 0.8 * line_h)]
         height = max(w["y1"] - w["y0"] for w in words)
-        row = band_gaps(min(w["y0"] for w in words), max(w["y1"] for w in words))
+        row = band_gaps(min(w["y0"] for w in words), max(w["y1"] for w in words), line_h)
         segments, current = [], [words[0]]
         for prev, word in zip(words, words[1:]):
             between = (prev["x1"], word["x0"])
             crosses_column = any(between[0] <= gs and ge <= between[1]
                                  for gs, ge in row)
-            if crosses_column or word["x0"] - prev["x1"] > max(2.5 * height, 40):
+            # Стёртая вертикальная линия между словами — рамка плитки или
+            # линейка таблицы: по ней режем всегда, какой бы ни был промежуток
+            crosses_rule = any(between[0] <= x * scale <= between[1]
+                               and min(word["y1"], prev["y1"]) > ry0 * scale
+                               and max(word["y0"], prev["y0"]) < ry1 * scale
+                               for ry0, ry1, x, _ in rules["down"])
+            if (crosses_column or crosses_rule
+                    or word["x0"] - prev["x1"] > max(2.5 * height, 40)):
                 segments.append(current)
                 current = []
             current.append(word)
@@ -2146,7 +2431,7 @@ def _ocr_lines(img, zh_check=False):
                 "col": key[:2],  # блок/абзац по версии Tesseract
             })
     out.sort(key=lambda l: (l["box"][1], l["box"][0]))
-    return out, [(gs / scale, ge / scale) for gs, ge in gaps], langs
+    return out, [(gs / scale, ge / scale) for gs, ge in gaps], langs, rules
 
 
 # Последний кусок — знаки препинания и буквы «полной ширины»: «，」）». Они тоже
@@ -2492,7 +2777,7 @@ def _font_guess(text, h, w):
     return min(h / _ink_ratio(text), (w / (0.5 * letters)) * 1.1)
 
 
-def _mark_cells(lines):
+def _mark_cells(lines, rules=None):
     """Отмечаем строки, стоящие в строке таблицы: «Бренд» и рядом «YATINEY».
 
     Признак — сосед на той же высоте через широкий провал, причём левая ячейка
@@ -2530,20 +2815,62 @@ def _mark_cells(lines):
         она считалась ячейкой и переводилась отдельно от первой строки. У
         таблицы строки над подписью такие же короткие подписи, а не строка
         вдвое длиннее, и стоят они не вплотную.
+
+        Второй вид хвоста — строка по центру под строкой выше, как подпись
+        плитки варианта на Amazon: «Coconut Milk» под «Pineapple Passionfruit
+        &». Середины строк совпадают, а края — нет: иначе это обычное
+        выравнивание по левому краю, и его судит первое правило. Соседняя
+        плитка справа стоит на той же высоте через широкий провал, и без
+        этого правила вторая строка подписи считалась ячейкой таблицы и
+        переводилась отдельно от первой — «Ананасовая маракуйя и» и
+        «Кокосовое молоко» вместо одного названия вкуса.
         """
         x0, y0, x1, y1 = line["box"]
         h = max(1.0, y1 - y0)
-        return any(o is not line and -0.3 * h <= y0 - o["box"][3] < 0.5 * h
-                   and abs(o["box"][0] - x0) < 1.5 * h
-                   and o["box"][2] - o["box"][0] >= 2 * (x1 - x0)
-                   for o in lines)
+        for o in lines:
+            if o is line:
+                continue
+            ox0, oy0, ox1, oy1 = o["box"]
+            # Зазор мерим по той строке, что выше: у строки без хвостатых букв
+            # («Coconut Milk») рамка на треть ниже, и свой же зазор в семь
+            # пикселей выходил «большим».
+            hh = max(h, oy1 - oy0)
+            if not -0.3 * hh <= y0 - oy1 < 0.5 * hh:
+                continue
+            # Линейка между строками — это шапка плитки и цена под ней
+            # («(Pack of 2)» и «$7.58»), не перенос
+            if rules and _ruled_apart(rules, o["box"], line["box"]):
+                continue
+            # Строка выше либо вдвое длиннее, либо дотянулась до края своей
+            # колонки (reaches) — тогда я её перенос, пусть мы и одной длины:
+            # так устроен любой абзац с рваным правым краем. Без этого вторая
+            # строка абзаца в левой колонке считалась ячейкой, стоило соседу
+            # справа оказаться далёкой колонкой текста, — и абзац «Компания
+            # Taicang… расположена / в Сучжоу… / химические машины…»
+            # переводился тремя кусками.
+            if abs(ox0 - x0) < 1.5 * h and (ox1 - ox0 >= 2 * (x1 - x0)
+                                             or o.get("reaches")):
+                return o
+            if (abs((ox0 + ox1) - (x0 + x1)) < h
+                    and abs(ox0 - x0) > 0.75 * h and abs(ox1 - x1) > 0.75 * h):
+                return o
+        return None
 
     for line in lines:
         line["cell"] = False
     whole = [l for l in lines if not fragment(l)]
-    tails = {id(l) for l in whole if continues(l)}
+    tails, heads = set(), set()
+    for l in whole:
+        head = continues(l)
+        if head is not None:
+            tails.add(id(l))
+            heads.add(id(head))
     for line in whole:
-        if id(line) in tails:
+        # Хвост абзаца — не ячейка; строка, у которой есть хвост, — тоже:
+        # иначе «Ищем закупки, проекты и» в сетке плиток выходило ячейкой (в
+        # соседней плитке справа текст стоит на той же высоте), и к ячейке
+        # нельзя было приклеить её же перенос «проекты».
+        if id(line) in tails or id(line) in heads:
             continue
         x0, y0, x1, y1 = line["box"]
         h = max(1.0, y1 - y0)
@@ -2659,31 +2986,39 @@ def _other_ink(a, b):
     return _hue_gap(a, b) >= ICON_COLOR_GAP or shade >= PARAGRAPH_SHADE_GAP
 
 
-def _group_paragraphs(lines, typical):
+def _group_paragraphs(lines, typical, rules=None):
     """Склеиваем строки в абзацы: одна колонка, общий блок, маленький зазор."""
     groups = []
     for line in lines:
         x0, y0, x1, y1 = line["box"]
         h = y1 - y0
         merged = False
-        # пункт списка всегда начинает новый абзац: иначе «25. …» и «26. …»
-        # слипаются в одно предложение — ломается и вёрстка, и перевод
-        if LIST_MARKER.match(line["text"]) or line["cell"]:
+        # Пункт списка всегда начинает новый абзац: иначе «25. …» и «26. …»
+        # слипаются в одно предложение — ломается и вёрстка, и перевод.
+        # Строка без единой буквы — цена, число, размер — тоже сама по себе:
+        # переводить в ней нечего, и поверх неё перевод не рисуется. Склеенная
+        # с подписью под ней («$3.79» и «($1.90 / count)») она перерисовывалась
+        # бы текстом «3,79 доллара США» чужим шрифтом.
+        bare = not any(c.isalpha() for c in line["text"])
+        if LIST_MARKER.match(line["text"]) or line["cell"] or bare:
             groups.append({"lines": [line["text"]], "box": [x0, y0, x1, y1],
                            "h_sum": h, "font_sum": _font_guess(line["text"], h, x1 - x0),
                            "conf": line["conf"], "col": line["col"],
-                           "cell": line["cell"], "reaches": line["reaches"],
+                           "cell": line["cell"], "bare": bare, "reaches": line["reaches"],
                            "last_y0": y0, "text_x0": line["text_x0"], "ink": line.get("ink")})
             continue
         # в многоколоночной вёрстке строки идут вперемежку по колонкам,
         # поэтому кандидата ищем среди всех недавних групп, а не только последней
         for prev in reversed(groups[-40:]):
-            if prev["cell"] or not prev["reaches"]:
-                # к ячейке таблицы ничего не приклеиваем, а строку, оборванную
-                # до края колонки, следующая не продолжает: это конец абзаца
+            if prev["cell"] or prev.get("bare") or not prev["reaches"]:
+                # к ячейке таблицы (и к голому числу) ничего не приклеиваем, а
+                # строку, оборванную до края колонки, следующая не продолжает:
+                # это конец абзаца
                 continue
             if typical and y0 - prev["last_y0"] > 1.35 * typical:
                 continue                 # шаг больше обычного — это отбивка
+            if rules and _ruled_apart(rules, prev["box"], line["box"]):
+                continue                 # между нами стёртая линейка: разные элементы
             px0, py0, px1, py1 = prev["box"]
             avg_h = prev["h_sum"] / len(prev["lines"])
             # Строки одного абзаца набраны одним кеглем. Значок над подписью
@@ -2715,8 +3050,12 @@ def _group_paragraphs(lines, typical):
             # с буллитом) и под самим маркером (нумерованный текст в чате).
             # Годится любой из них, иначе половина списков рвётся на строки.
             tol = max(1.5 * avg_h, 12)
+            # Третий способ — по центру: двухстрочная подпись плитки варианта
+            # («Honey Apple & Mango» и под ней «Melonade»). Левые края у таких
+            # строк гуляют на ширину слова, а середины совпадают до пикселя.
             aligned = (abs(line["text_x0"] - prev["text_x0"]) < tol
-                       or abs(x0 - px0) < tol)
+                       or abs(x0 - px0) < tol
+                       or abs((x0 + x1) - (px0 + px1)) < avg_h)
             # На совпадение блоков Tesseract полагаться нельзя: при чуть большем
             # межстрочном он разносит строки одного абзаца по разным блокам, и
             # предложение переводилось двумя кусками — с ломаной грамматикой.
@@ -3065,7 +3404,7 @@ def _zh_lines(img):
     words = [{"x0": int(l["box"][0]), "x1": int(l["box"][2])} for l in keep]
     median_h = sorted(l["box"][3] - l["box"][1] for l in keep)[len(keep) // 2] if keep else 10
     gaps = _column_gaps(words, img.width, max(10, int(0.9 * median_h))) if len(keep) > 1 else []
-    return keep, gaps, "chi_sim"
+    return keep, gaps, "chi_sim", {"across": [], "down": []}
 
 
 def ocr_blocks(img):
@@ -3088,22 +3427,28 @@ def ocr_blocks(img):
             except Exception as e:
                 log(f"китайский пакет не сработал ({e})")
             found = found or _ocr_lines(img)
-    lines, gaps, langs = found
+    lines, gaps, langs, rules = found
     source = img.convert("RGB")
     for line in lines:
         _, count, color = _ink_stats(source, line["box"])
         line["ink"] = color if count else None
-    lines = _mark_reach(_mark_cells(lines))
+    # сначала «дотянулась ли строка до края колонки»: по этому признаку
+    # разметка ячеек отличает перенос абзаца от строки таблицы
+    lines = _mark_cells(_mark_reach(lines), rules)
     step = _typical_step(lines)          # обычный шаг строк внутри абзаца
     blocks, skipped = [], 0
-    for g in _group_paragraphs(lines, step):
+    for g in _group_paragraphs(lines, step, rules):
         text = " ".join(g["lines"]).strip()
         if not text:
             continue
         # Ячейку таблицы с числом («4», «36" x 39" x 87"») фильтр мусора режет:
         # переводить там нечего. Но рядом стоит её подпись, и без значения
-        # строка выглядит оборванной, поэтому ячейки оставляем как есть.
-        if not looks_like_text(text, g["conf"]) and not (g["cell"] and g["conf"] >= 60):
+        # строка выглядит оборванной, поэтому ячейки оставляем как есть. Так же
+        # и цену, стоящую строкой сама по себе («$3.79» над «($1.90 / count)»):
+        # в тексте она нужна. Голый знак без цифр («&», «©») — всё же мусор.
+        number = g.get("bare") and any(c.isdigit() for c in text)
+        if (not looks_like_text(text, g["conf"])
+                and not ((g["cell"] or number) and g["conf"] >= 60)):
             skipped += 1
             continue
         x0, y0, x1, y1 = g["box"]
