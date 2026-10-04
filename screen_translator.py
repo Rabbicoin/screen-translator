@@ -1456,11 +1456,12 @@ class _MONITORINFO(ctypes.Structure):
                 ("rcWork", _RECT), ("dwFlags", ctypes.c_ulong)]
 
 
-def monitor_rect_at(x, y):
+def monitor_rect_at(x, y, whole=False):
     """Рабочая область монитора под точкой (без панели задач).
 
     Нужна окну результата: на нескольких мониторах размеры и координаты разные,
     и держать окно надо на том экране, куда его перетащили, а не на главном.
+    `whole` — весь монитор вместе с панелью задач.
     При любой осечке откатываемся ко всему рабочему пространству.
     """
     if sys.platform != "win32":
@@ -1472,7 +1473,7 @@ def monitor_rect_at(x, y):
         mi.cbSize = ctypes.sizeof(_MONITORINFO)
         if not u.GetMonitorInfoW(hmon, ctypes.byref(mi)):
             return virtual_screen_rect()
-        r = mi.rcWork
+        r = mi.rcMonitor if whole else mi.rcWork
         if r.right - r.left < 100 or r.bottom - r.top < 100:
             return virtual_screen_rect()
         return r.left, r.top, r.right - r.left, r.bottom - r.top
@@ -5198,10 +5199,14 @@ class ResultWindow:
 
 
 class Toast:
-    """Небольшая плашка со статусом (например «Распознаю…»)."""
+    """Небольшая плашка со статусом (например «Распознаю…»).
 
-    def __init__(self, root, text):
-        vx, vy, vw, vh = virtual_screen_rect()
+    Встаёт внизу посередине монитора, где точка `at` (угол выделенной области),
+    а без неё — где мышь. Не всего рабочего пространства: при мониторах разной
+    высоты его низ бывает ниже края любого из них, и плашку не видно.
+    """
+
+    def __init__(self, root, text, at=None):
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
@@ -5212,7 +5217,10 @@ class Toast:
                  highlightbackground=c["line"]).pack()
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
-        self.win.geometry(f"+{vx + (vw - w) // 2}+{vy + vh - h - 90}")
+        if at is None:
+            at = (self.win.winfo_pointerx(), self.win.winfo_pointery())
+        mx, my, mw, mh = monitor_rect_at(*at, whole=True)
+        self.win.geometry(f"+{mx + (mw - w) // 2}+{my + mh - h - 90}")
 
     def close(self):
         try:
@@ -5480,7 +5488,7 @@ class App:
     def _on_area(self, shot, origin, box):
         crop = shot.crop(box)
         screen_xy = (origin[0] + box[0], origin[1] + box[1])
-        toast = Toast(self.root, tr("working"))
+        toast = Toast(self.root, tr("working"), screen_xy)
         threading.Thread(target=self._work, args=(crop, screen_xy, toast), daemon=True).start()
 
     def _work(self, crop, screen_xy, toast):
@@ -5556,7 +5564,7 @@ class App:
         Переснимать экран не нужно: снимок остался в памяти, повторяется только
         распознавание с переводом.
         """
-        toast = Toast(self.root, tr("working"))
+        toast = Toast(self.root, tr("working"), screen_xy)
         threading.Thread(target=self._work, args=(crop, screen_xy, toast),
                          daemon=True).start()
 
@@ -5625,7 +5633,7 @@ class App:
     def _on_price_area(self, shot, origin, box):
         crop = shot.crop(box)
         screen_xy = (origin[0] + box[0], origin[1] + box[1])
-        toast = Toast(self.root, tr("cur_working"))
+        toast = Toast(self.root, tr("cur_working"), screen_xy)
         threading.Thread(target=self._work_prices, args=(crop, screen_xy, toast),
                          daemon=True).start()
 
