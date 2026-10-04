@@ -3763,11 +3763,22 @@ CACHE_LIMIT = 200
 _cache = {}
 
 
+# «2 Count» на плитке Amazon — «2 штуки в упаковке». Сам по себе, без соседних
+# слов, этот кусок Google переводит как банковский счёт («2 счета»), «5 Count» —
+# «5 отсчетов», «12 Count» — «12 графов». Слово «pcs» он понимает однозначно на
+# любом языке перевода: «2 шт.», «2 Stk». Меняем только «Count» с большой буквы
+# сразу после числа — так пишут именно размер упаковки; «Word count: 2» и
+# «400 Thread Count» не трогаем.
+PACK_COUNT = re.compile(r"\b(\d+)\s+Count\b")
+
+
 def translate(text, target=None, source_hint=None):
     target = target or CFG.get("target_lang", "ru")
     text = text.strip()
     if not text:
         return "", ""
+    if target != "en":                 # на английский «2 Count» и так понятно
+        text = PACK_COUNT.sub(r"\1 pcs", text)
     # у запасного сервиса нет автоопределения: берём подсказку от OCR,
     # а если её нет — грубо по алфавиту
     src = source_hint or ("ru" if is_cyrillic(text) else "en")
