@@ -2419,6 +2419,10 @@ CJK_INK_RATIO = 0.9
 # в один абзац. У строк одного абзаца оценка гуляет на пятую часть, у значка над
 # подписью она больше вдвое-втрое.
 PARAGRAPH_FONT_SPREAD = 1.5
+# Насколько может различаться яркость чернил соседних строк одного абзаца.
+# Средний цвет мелкой строки светлее крупной из-за сглаживания краёв — на
+# несколько десятков; серая подпись (#999) от чёрного текста — на сотню.
+PARAGRAPH_SHADE_GAP = 70
 
 # Чем «чужое» на картинке отличается от фона, когда перевод ищет, куда ему
 # расти. Порог — разница яркости с цветом фона: серый текст «已售1000+» (#999
@@ -2505,10 +2509,29 @@ def _mark_cells(lines):
                    and min(x1, o["box"][2]) - max(x0, o["box"][0]) >= 0.5 * (x1 - x0)
                    for o in lines)
 
+    def continues(line):
+        """Хвост абзаца: вплотную под длинной строкой с тем же левым краем.
+
+        Вторая строка названия товара («匀浆机» под «实验室高剪切分散乳化机/均质机/»)
+        коротка, и провал от неё до соседней карточки выходит «табличным» —
+        она считалась ячейкой и переводилась отдельно от первой строки. У
+        таблицы строки над подписью такие же короткие подписи, а не строка
+        вдвое длиннее, и стоят они не вплотную.
+        """
+        x0, y0, x1, y1 = line["box"]
+        h = max(1.0, y1 - y0)
+        return any(o is not line and -0.3 * h <= y0 - o["box"][3] < 0.5 * h
+                   and abs(o["box"][0] - x0) < 1.5 * h
+                   and o["box"][2] - o["box"][0] >= 2 * (x1 - x0)
+                   for o in lines)
+
     for line in lines:
         line["cell"] = False
     whole = [l for l in lines if not fragment(l)]
+    tails = {id(l) for l in whole if continues(l)}
     for line in whole:
+        if id(line) in tails:
+            continue
         x0, y0, x1, y1 = line["box"]
         h = max(1.0, y1 - y0)
         # Сравниваем только с ближайшим соседом справа. Пока сверялись со всеми
@@ -2521,6 +2544,8 @@ def _mark_cells(lines):
         if not row:
             continue
         other = min(row, key=lambda o: o["box"][0])
+        if id(other) in tails:
+            continue                 # справа хвост чужого абзаца, а не значение ячейки
         gap = other["box"][0] - x1
         # Где на самом деле кончается моя колонка, показывают строки над и под
         # мной: последняя строка абзаца короче прочих, и провал от неё до
@@ -2611,6 +2636,16 @@ def _typical_step(lines):
     return steps[len(steps) // 4] if steps else 0
 
 
+def _other_ink(a, b):
+    """Строки набраны разным цветом: по оттенку (оранжевое и чёрное) или по
+    яркости (серая подпись и чёрный заголовок). Цвета нет — не судим."""
+    if a is None or b is None:
+        return False
+    shade = abs((0.299 * a[0] + 0.587 * a[1] + 0.114 * a[2])
+                - (0.299 * b[0] + 0.587 * b[1] + 0.114 * b[2]))
+    return _hue_gap(a, b) >= ICON_COLOR_GAP or shade >= PARAGRAPH_SHADE_GAP
+
+
 def _group_paragraphs(lines, typical):
     """Склеиваем строки в абзацы: одна колонка, общий блок, маленький зазор."""
     groups = []
@@ -2625,7 +2660,7 @@ def _group_paragraphs(lines, typical):
                            "h_sum": h, "font_sum": _font_guess(line["text"], h, x1 - x0),
                            "conf": line["conf"], "col": line["col"],
                            "cell": line["cell"], "reaches": line["reaches"],
-                           "last_y0": y0, "text_x0": line["text_x0"]})
+                           "last_y0": y0, "text_x0": line["text_x0"], "ink": line.get("ink")})
             continue
         # в многоколоночной вёрстке строки идут вперемежку по колонкам,
         # поэтому кандидата ищем среди всех недавних групп, а не только последней
@@ -2647,6 +2682,13 @@ def _group_paragraphs(lines, typical):
             font = _font_guess(line["text"], h, x1 - x0)
             prev_font = prev["font_sum"] / len(prev["lines"])
             if max(font, prev_font) > PARAGRAPH_FONT_SPREAD * max(1.0, min(font, prev_font)):
+                continue
+            # И одним цветом. Под названием товара на витрине стоят строки
+            # другим цветом — оранжевые «复购率 43%» и «分享再减 9 元», серая
+            # подпись под чёрным заголовком плитки. По расположению они
+            # неотличимы от последней строки названия и приклеивались к нему:
+            # «…сумка через плечо, процент повторных покупок 59%».
+            if _other_ink(line.get("ink"), prev.get("ink")):
                 continue
             gap = y0 - py1
             # Перенос внутри предложения терпит зазор побольше: строки одного
@@ -2682,7 +2724,7 @@ def _group_paragraphs(lines, typical):
                            "h_sum": h, "font_sum": _font_guess(line["text"], h, x1 - x0),
                            "conf": line["conf"], "col": line["col"],
                            "cell": False, "reaches": line["reaches"], "last_y0": y0,
-                           "text_x0": line["text_x0"]})
+                           "text_x0": line["text_x0"], "ink": line.get("ink")})
     return groups
 
 
@@ -2700,13 +2742,16 @@ def _group_paragraphs(lines, typical):
 # поэтому пакет берётся только для китайского.
 ZH_PACK_VERSION = "1"
 ZH_PACK_SIZE_MB = 81
-ZH_PACK_SHA256 = "2594bbf951f142a21100452deaff5377e68b76bb9477f472b06e0dad907773d7"
+ZH_PACK_SHA256 = "f97f22cb584cc7c5a2b552dd7f393172f441d1c236a7cbf3dd4bf19ab7fa9f19"
 ZH_PACK_URL = ("https://github.com/Rabbicoin/screen-translator/releases/download/"
                f"zh-ocr-{ZH_PACK_VERSION}/ChineseOCR-{ZH_PACK_VERSION}.zip")
 ZH_PACK_DIR = os.path.join(DATA_DIR, "zh_ocr")
 # Сколько ждать ответа помощника. Первый запуск дольше: он грузит модели.
 ZH_START_TIMEOUT = 90
 ZH_READ_TIMEOUT = 60
+# Куски одной строки, разрезанной пакетом, склеиваем, если между ними не больше
+# стольких высот строки. Соседние карточки витрины стоят через три-четыре.
+ZH_JOIN_GAP = 1.2
 
 
 class ZhOcr:
@@ -2763,6 +2808,27 @@ class ZhOcr:
             raise RuntimeError((hello or {}).get("error") or "китайский пакет не запустился")
         cls._proc, cls._answers = proc, answers
         log(f"китайский пакет запущен, версия {hello.get('version')}")
+
+    @classmethod
+    def warm_up(cls):
+        """Запустить помощника заранее, в фоне — по нажатию горячей клавиши.
+
+        Запуск с загрузкой моделей и первым прогоном занимает секунды, а
+        человек как раз тратит их на выделение области. Пока он выделяет,
+        пакет успевает подняться, и первый же китайский снимок не ждёт.
+        """
+        if not cls.installed() or (cls._proc is not None and cls._proc.poll() is None):
+            return
+
+        def work():
+            with cls._lock:
+                if cls._proc is None or cls._proc.poll() is not None:
+                    try:
+                        cls._start()
+                    except Exception as e:
+                        log(f"китайский пакет не запустился заранее: {e}")
+
+        threading.Thread(target=work, daemon=True).start()
 
     @classmethod
     def read(cls, img):
@@ -2927,23 +2993,48 @@ def _zh_lines(img):
         log("китайский пакет прочитал не китайский текст — читаем Tesseract-ом")
         return None
     source = img.convert("RGB")
-    lines = []
-    for i, item in enumerate(raw):
-        text = BULLET_JUNK.sub("• ", item["text"].strip())
-        if not text:
+    # Длинную строку пакет иногда режет на куски: описание компании во всю
+    # ширину пришло тремя рамками, каждая переводилась отдельно и втискивалась
+    # в свою узкую колонку, а куски между ними оставались по-китайски. Куски
+    # одной строки — на одной высоте и почти вплотную; соседние карточки и
+    # ячейки таблицы стоят через провал в несколько высот строки.
+    pieces = sorted((dict(item, text=item["text"].strip()) for item in raw
+                     if item["text"].strip()), key=lambda l: (l["box"][1], l["box"][0]))
+    joined = []
+    for item in sorted(pieces, key=lambda l: l["box"][0]):
+        x0, y0, x1, y1 = item["box"]
+        h = y1 - y0
+        prev = next((p for p in joined
+                     if 0 <= x0 - p["box"][2] <= ZH_JOIN_GAP * h
+                     and min(y1, p["box"][3]) - max(y0, p["box"][1])
+                     >= 0.6 * min(h, p["box"][3] - p["box"][1])), None)
+        if prev is None:
+            joined.append(dict(item, box=list(item["box"])))
             continue
+        glue = "" if _is_cjk(prev["text"][-1]) or _is_cjk(item["text"][0]) else " "
+        prev["text"] += glue + item["text"]
+        prev["score"] = min(prev["score"], item["score"])
+        prev["box"] = [prev["box"][0], min(prev["box"][1], y0), x1, max(prev["box"][3], y1)]
+    lines = []
+    for i, item in enumerate(sorted(joined, key=lambda l: (l["box"][1], l["box"][0]))):
+        text = BULLET_JUNK.sub("• ", item["text"])
         x0, y0, x1, y1 = item["box"]
         lines.append({"text": text, "box": [x0, y0, x1, y1], "text_x0": x0,
                       "conf": item["score"] * 100, "col": (i, 1),
                       "ink": _ink_stats(source, (x0, y0, x1, y1))})
     # Значки RapidOCR читает отдельной строкой: синий квадрат с «R» — «R»,
-    # плашка «失信» — «失信». Выдают их, как и у Tesseract, плотная заливка и
-    # цвет, отличный от ближайшей настоящей надписи.
+    # плашка «失信» — «失信». Выдают их, как и у Tesseract, плотная заливка,
+    # цвет, отличный от ближайшей настоящей надписи, и форма: значок почти
+    # квадратный. Без проверки формы за значок шло красное «面议» («цена
+    # договорная») — два знака, вытянутые в ширину.
     long_lines = [l for l in lines if len(l["text"]) > 2 and l["ink"][1]]
     keep = []
     for line in lines:
         density, count, color = line["ink"]
-        if len(line["text"]) <= 2 and count and density >= ICON_INK and long_lines:
+        w = line["box"][2] - line["box"][0]
+        h = max(1, line["box"][3] - line["box"][1])
+        if (len(line["text"]) <= 2 and count and density >= ICON_INK and long_lines
+                and 0.6 <= w / h <= 1.6):
             cx, cy = (line["box"][0] + line["box"][2]) / 2, (line["box"][1] + line["box"][3]) / 2
             near = min(long_lines, key=lambda l: abs((l["box"][0] + l["box"][2]) / 2 - cx)
                        + abs((l["box"][1] + l["box"][3]) / 2 - cy))
@@ -2969,6 +3060,10 @@ def ocr_blocks(img):
         except Exception as e:
             log(f"китайский пакет не сработал ({e}) — читаем Tesseract-ом")
     lines, gaps, langs = found or _ocr_lines(img)
+    source = img.convert("RGB")
+    for line in lines:
+        _, count, color = _ink_stats(source, line["box"])
+        line["ink"] = color if count else None
     lines = _mark_reach(_mark_cells(lines))
     step = _typical_step(lines)          # обычный шаг строк внутри абзаца
     blocks, skipped = [], 0
@@ -5784,6 +5879,8 @@ class App:
             print("Не удалось сделать снимок экрана:", e)
             return
         handler = on_area or self._on_area
+        if on_area is None:
+            ZhOcr.warm_up()          # пока выделяют область, китайский пакет поднимается
         SelectionOverlay(self.root, shot, (ox, oy),
                          lambda box: handler(shot, (ox, oy), box))
         log("окно выделения создано")

@@ -34,7 +34,17 @@ def main():
         import numpy as np
         from PIL import Image
         from rapidocr_onnxruntime import RapidOCR
-        engine = RapidOCR()
+        # Узкий снимок RapidOCR растягивает, пока меньшая сторона не станет 736
+        # точек: полоска витрины высотой 281 раздувалась втрое, и поиск строк
+        # шёл дольше всего остального. При 640 на десяти кусках витрин вышло на
+        # пятую часть быстрее, текст страниц тот же; при 512 быстрее ещё, но
+        # мелкие надписи на фотографиях товаров начинали читаться с ошибками.
+        engine = RapidOCR(det_limit_side_len=640)
+        # Первое распознавание после запуска заметно дольше следующих: движок
+        # готовит вычисления. Делаем его сейчас, на картинке размером с экран, —
+        # пока человек ещё выделяет область (переводчик запускает пакет по
+        # нажатию горячей клавиши).
+        engine(np.full((720, 1280, 3), 255, dtype=np.uint8), use_cls=False)
     except Exception as e:
         _send({"ready": False, "error": f"{type(e).__name__}: {e}"})
         return 1
@@ -51,8 +61,10 @@ def main():
         try:
             image = Image.open(request["path"]).convert("RGB")
             t0 = time.perf_counter()
-            # RapidOCR ждёт порядок каналов opencv: синий, зелёный, красный
-            result, _ = engine(np.array(image)[:, :, ::-1])
+            # RapidOCR ждёт порядок каналов opencv: синий, зелёный, красный.
+            # Проверка «не перевёрнута ли строка» снимкам экрана не нужна —
+            # там текст всегда прямо, а стоит она до четверти времени.
+            result, _ = engine(np.array(image)[:, :, ::-1], use_cls=False)
             lines = []
             for box, text, score in result or []:
                 xs = [float(p[0]) for p in box]
