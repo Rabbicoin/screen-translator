@@ -14,6 +14,7 @@
 import datetime as dt
 import json
 import os
+import re
 import time
 import urllib.request
 from zoneinfo import ZoneInfo
@@ -29,8 +30,11 @@ def fetch_counts():
     request = urllib.request.Request(url, headers={"User-Agent": "ScreenTranslator-stats"})
     with urllib.request.urlopen(request, timeout=30) as response:
         releases = json.load(response)
+    # Только версии программы («1.1.3»): релиз китайского пакета («zh-ocr-1»)
+    # в счёт скачиваний программы не идёт
     return {r["tag_name"].lstrip("v"): sum(a.get("download_count", 0) for a in r.get("assets", []))
-            for r in releases if not r.get("draft")}
+            for r in releases
+            if not r.get("draft") and re.match(r"^\d+(\.\d+)+$", r["tag_name"].lstrip("v"))}
 
 
 def main():

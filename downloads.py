@@ -26,6 +26,7 @@ GitHub не даёт, поэтому вычитаем здесь.
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.request
@@ -91,6 +92,11 @@ def period_text(start, end):
     return f"{start:%d.%m}–{end:%d.%m}"
 
 
+# Метка версии программы: «1.1.3», «1.0.9». Прочие релизы (китайский пакет
+# «zh-ocr-1») в счёт не идут.
+VERSION_TAG = re.compile(r"^\d+(\.\d+)+$")
+
+
 def fetch_releases():
     url = f"https://api.github.com/repos/{REPO}/releases?per_page=100"
     request = urllib.request.Request(url, headers={"User-Agent": "ScreenTranslator-stats"})
@@ -105,6 +111,11 @@ def collect(releases, own):
         if release.get("draft") or not release.get("published_at"):
             continue
         version = release["tag_name"].lstrip("v")   # у первых версий тег был с «v»
+        # Релиз с китайским пакетом («zh-ocr-1») — не версия программы: его
+        # скачивания к счёту версий не относятся, а «свежей версией» он быть
+        # не должен
+        if not VERSION_TAG.match(version):
+            continue
         counted = sum(a.get("download_count", 0) for a in release.get("assets", []))
         published = dt.datetime.fromisoformat(
             release["published_at"].replace("Z", "+00:00")).astimezone()
