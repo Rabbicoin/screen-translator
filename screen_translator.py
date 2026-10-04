@@ -19,6 +19,7 @@ APP_VERSION = "1.1.2"
 
 import ctypes
 import glob
+import hashlib
 import html
 import webbrowser
 import json
@@ -27,11 +28,13 @@ import queue
 import re
 from concurrent.futures import ThreadPoolExecutor
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import traceback
+import zipfile
 
 # консоль Windows по умолчанию не в UTF-8 — иначе русские сообщения превращаются в кракозябры
 for stream in (sys.stdout, sys.stderr):
@@ -420,14 +423,25 @@ def detect_script(img):
     того, какие языки установлены. По письменности дальше выбираем языки:
     гонять распознавание сразу всеми установленными и медленно, и менее точно.
     """
+    # Один и тот же снимок спрашивают дважды: решая, звать ли китайский пакет,
+    # и выбирая языки Tesseract, если пакет не взялся. Ответ на последний
+    # снимок помним — это треть секунды.
+    key = (img.size, img.mode, hashlib.md5(img.tobytes()).digest())
+    if _osd_last.get("key") == key:
+        return _osd_last["result"]
     try:
         osd = pytesseract.image_to_osd(
             img, output_type=Output.DICT,
             config="--psm 0 -c min_characters_to_try=8")
-        return osd.get("script"), float(osd.get("script_conf") or 0)
+        result = osd.get("script"), float(osd.get("script_conf") or 0)
     except Exception as e:
         log("OSD не определил письменность:", e)
-        return None, 0.0
+        result = None, 0.0
+    _osd_last.update(key=key, result=result)
+    return result
+
+
+_osd_last = {}
 
 
 # Ниже этого порога OSD ошибается: на коротком тексте он уверенно называет
@@ -860,6 +874,25 @@ UI_STRINGS = {
     "key_pick":      ("Сначала выберите платный сервис в меню «Сервис перевода».",
                       "First pick a paid service in the «Translation service» menu."),
     "menu_hotkeys":  ("Горячие клавиши…", "Keyboard shortcuts…"),
+    "zh_offer_title": ("Китайский пакет распознавания", "Chinese text recognition pack"),
+    "zh_offer_text": ("Иероглифы точнее и быстрее читает отдельный пакет распознавания:\n"
+                      "на витринах и в карточках товаров он находит почти весь текст.\n"
+                      "Скачать его ({size} МБ)? Это один раз.",
+                      "A separate recognition pack reads Chinese characters more accurately\n"
+                      "and faster: on shop pages it finds almost all the text.\n"
+                      "Download it ({size} MB)? You only need to do it once."),
+    "zh_download":   ("Скачать", "Download"),
+    "zh_later":      ("Не сейчас", "Not now"),
+    "zh_never":      ("Не предлагать", "Don't ask again"),
+    "zh_progress":   ("Скачиваю китайский пакет… {pct}%", "Downloading the Chinese pack… {pct}%"),
+    "zh_installing": ("Устанавливаю китайский пакет…", "Installing the Chinese pack…"),
+    "zh_done":       ("Китайский пакет установлен: иероглифы теперь читает он",
+                      "Chinese pack installed: it now reads Chinese text"),
+    "zh_failed":     ("Китайский пакет не установился: {err}",
+                      "The Chinese pack couldn't be installed: {err}"),
+    "zh_menu_get":   ("Скачать китайский пакет ({size} МБ)", "Download Chinese pack ({size} MB)"),
+    "zh_menu_remove": ("Удалить китайский пакет", "Remove Chinese pack"),
+    "zh_removed":    ("Китайский пакет удалён", "Chinese pack removed"),
     "hk_title":      ("Горячие клавиши", "Keyboard shortcuts"),
     "hk_hint":       ("Щёлкните по сочетанию и нажмите новое — какое удобно.\n"
                       "Нужен Ctrl, Alt или Win: одиночная клавиша перестала бы "
@@ -1954,22 +1987,9 @@ def _ocr_lines(img):
     source = img.convert("RGB")
 
     def ink_of(word):
-        """Чернила слова на исходном снимке: (их доля в рамке, сколько их, средний цвет)."""
-        x0, y0 = int(word["x0"] / scale), int(word["y0"] / scale)
-        x1, y1 = int(-(-word["x1"] // scale)), int(-(-word["y1"] // scale))
-        if x1 - x0 < 3 or y1 - y0 < 3:
-            return 0.0, 0, (0, 0, 0)
-        bg = _background_of(source.crop((max(0, x0 - 2), max(0, y0 - 2),
-                                         min(source.width, x1 + 2),
-                                         min(source.height, y1 + 2))))[0]
-        inner = source.crop((x0, y0, x1, y1))
-        mask = ImageChops.difference(inner, Image.new("RGB", inner.size, bg)).convert(
-            "L").point(lambda v: 255 if v > INK_TOLERANCE else 0)
-        count = mask.tobytes().count(b"\xff")
-        if not count:
-            return 0.0, 0, (0, 0, 0)
-        color = tuple(ImageStat.Stat(inner, mask).mean)
-        return count / ((x1 - x0) * (y1 - y0)), count, color
+        """Чернила слова на исходном снимке: рамка Tesseract — в масштабе прохода."""
+        return _ink_stats(source, (word["x0"] / scale, word["y0"] / scale,
+                                   -(-word["x1"] // scale), -(-word["y1"] // scale)))
 
     def icons(words):
         """Значки, прочитанные как иероглиф или знак: «园» вместо синего квадрата с «Z».
@@ -1999,9 +2019,7 @@ def _ocr_lines(img):
             # Сравниваем оттенок, а не яркость: жирное чёрное «精选货源» среди
             # серых пунктов меню по яркости тоже «другого цвета», но оба серые.
             # Синий значок от серых букв отличается именно цветом.
-            hue = [c - sum(color) / 3 for c in color]
-            ref_hue = [c - sum(ref) / 3 for c in ref]
-            if sum(abs(hue[i] - ref_hue[i]) for i in range(3)) >= ICON_COLOR_GAP:
+            if _hue_gap(color, ref) >= ICON_COLOR_GAP:
                 found.add(id(w))
         return found
 
@@ -2668,9 +2686,289 @@ def _group_paragraphs(lines, typical):
     return groups
 
 
+# --------------------------------------------------------------------------------------
+#  Китайский пакет: распознавание иероглифов через RapidOCR
+# --------------------------------------------------------------------------------------
+# Tesseract на китайском слаб: мелкие серые подписи витрин он читает кусками,
+# путает знаки («批量» → «批星», «¥» → «半»), а синяя шапка сайта сбивает его
+# разбор так, что не находится ни одного слова. RapidOCR сделан под китайский и
+# на тех же снимках читает почти всё без ошибок, да ещё быстрее. Но он тянет
+# библиотеки на сотню мегабайт, а китайский нужен не всем — поэтому он идёт
+# отдельным пакетом: человек скачивает его по предложению программы, и пакет
+# работает отдельной программой (zh_ocr_helper.py, сборка — build_zh_pack.py).
+# Латиницу RapidOCR читает хуже Tesseract (теряет пробелы между словами),
+# поэтому пакет берётся только для китайского.
+ZH_PACK_VERSION = "1"
+ZH_PACK_SIZE_MB = 81
+ZH_PACK_SHA256 = "2594bbf951f142a21100452deaff5377e68b76bb9477f472b06e0dad907773d7"
+ZH_PACK_URL = ("https://github.com/Rabbicoin/screen-translator/releases/download/"
+               f"zh-ocr-{ZH_PACK_VERSION}/ChineseOCR-{ZH_PACK_VERSION}.zip")
+ZH_PACK_DIR = os.path.join(DATA_DIR, "zh_ocr")
+# Сколько ждать ответа помощника. Первый запуск дольше: он грузит модели.
+ZH_START_TIMEOUT = 90
+ZH_READ_TIMEOUT = 60
+
+
+class ZhOcr:
+    """Помощник с RapidOCR: запускается один раз при первом китайском снимке и живёт
+    до выхода из программы — модели грузятся секунды, на каждый снимок их не грузим."""
+
+    _lock = threading.Lock()
+    _proc = None
+    _answers = None
+    _next_id = 0
+
+    @staticmethod
+    def command():
+        """Чем запускать помощника; None — пакета нет.
+
+        ST_ZH_OCR_PY — для разработки: питон с RapidOCR, которым запустить
+        zh_ocr_helper.py из исходников, не собирая пакет.
+        """
+        dev = os.environ.get("ST_ZH_OCR_PY")
+        if dev and not FROZEN:
+            return [dev, os.path.join(APP_DIR, "zh_ocr_helper.py")]
+        exe = os.path.join(ZH_PACK_DIR, "zh_ocr.exe")
+        return [exe] if os.path.isfile(exe) else None
+
+    @classmethod
+    def installed(cls):
+        return cls.command() is not None
+
+    @classmethod
+    def _start(cls):
+        cmd = cls.command()
+        if not cmd:
+            raise RuntimeError("китайский пакет не установлен")
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, cwd=os.path.dirname(cmd[-1]),
+                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        answers = queue.Queue()
+
+        def pump():
+            for raw in proc.stdout:
+                try:
+                    answers.put(json.loads(raw.decode("utf-8")))
+                except ValueError:
+                    pass
+            answers.put(None)                   # помощник закрылся
+
+        threading.Thread(target=pump, daemon=True).start()
+        try:
+            hello = answers.get(timeout=ZH_START_TIMEOUT)
+        except queue.Empty:
+            hello = None
+        if not hello or not hello.get("ready"):
+            proc.kill()
+            raise RuntimeError((hello or {}).get("error") or "китайский пакет не запустился")
+        cls._proc, cls._answers = proc, answers
+        log(f"китайский пакет запущен, версия {hello.get('version')}")
+
+    @classmethod
+    def read(cls, img):
+        """Строки RapidOCR: [{"box": [x0, y0, x1, y1], "text": …, "score": …}]."""
+        with cls._lock:
+            if cls._proc is None or cls._proc.poll() is not None:
+                cls._start()
+            fd, path = tempfile.mkstemp(suffix=".png")
+            os.close(fd)
+            try:
+                img.save(path)
+                cls._next_id += 1
+                rid = cls._next_id
+                cls._proc.stdin.write((json.dumps({"id": rid, "path": path}) + "\n")
+                                      .encode("utf-8"))
+                cls._proc.stdin.flush()
+                while True:
+                    try:
+                        answer = cls._answers.get(timeout=ZH_READ_TIMEOUT)
+                    except queue.Empty:
+                        answer = None
+                    if answer is None:
+                        cls.stop()
+                        raise RuntimeError("китайский пакет не ответил")
+                    if answer.get("id") == rid:
+                        break
+                if "error" in answer:
+                    raise RuntimeError(answer["error"])
+                log(f"китайский пакет: строк {len(answer['lines'])}, "
+                    f"{answer.get('time', 0):.2f} с")
+                return answer["lines"]
+            finally:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    @classmethod
+    def stop(cls):
+        proc, cls._proc = cls._proc, None
+        if proc is None:
+            return
+        try:
+            proc.stdin.close()
+            proc.wait(timeout=3)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def install_zh_pack(progress=None, installing=None):
+    """Скачать китайский пакет, сверить контрольную сумму, распаковать, проверить запуском.
+
+    `progress(проценты)` зовётся по ходу скачивания, `installing()` — перед
+    распаковкой. Сумма зашита в программу: скачанное потом запускается, и
+    подменённый или битый архив запускать нельзя. Старый пакет заменяется,
+    только когда новый уже распакован и ответил «готов».
+    """
+    custom = str(CFG.get("zh_pack_url") or "").strip()
+    part = os.path.join(DATA_DIR, "zh_ocr_download.part")
+    digest = hashlib.sha256()
+    try:
+        with requests.get(custom or ZH_PACK_URL, stream=True, timeout=30, headers=UA) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("content-length") or 0)
+            got, shown = 0, -1
+            with open(part, "wb") as f:
+                for chunk in r.iter_content(1 << 16):
+                    f.write(chunk)
+                    digest.update(chunk)
+                    got += len(chunk)
+                    pct = int(got * 100 / total) if total else 0
+                    if progress and pct != shown:
+                        progress(pct)
+                        shown = pct
+        if not custom and digest.hexdigest() != ZH_PACK_SHA256:
+            raise RuntimeError("архив повреждён: не сходится контрольная сумма")
+        if installing:
+            installing()
+        fresh = ZH_PACK_DIR + ".new"
+        shutil.rmtree(fresh, ignore_errors=True)
+        with zipfile.ZipFile(part) as z:
+            root = os.path.normpath(fresh) + os.sep
+            # распаковываем только внутрь своей папки — «..\..\» в имени не пускаем
+            if any(not os.path.normpath(os.path.join(fresh, n)).startswith(root)
+                   for n in z.namelist()):
+                raise RuntimeError("в архиве посторонние пути")
+            z.extractall(fresh)
+        exe = os.path.join(fresh, "zh_ocr", "zh_ocr.exe")
+        if not os.path.isfile(exe):
+            raise RuntimeError("в архиве нет zh_ocr.exe")
+        probe = subprocess.run([exe, "--selftest"], capture_output=True,
+                               timeout=ZH_START_TIMEOUT, cwd=os.path.dirname(exe),
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if b'"ready": true' not in probe.stdout:
+            raise RuntimeError("пакет не запускается на этом компьютере")
+        ZhOcr.stop()
+        shutil.rmtree(ZH_PACK_DIR, ignore_errors=True)
+        os.replace(os.path.join(fresh, "zh_ocr"), ZH_PACK_DIR)
+        shutil.rmtree(fresh, ignore_errors=True)
+    finally:
+        try:
+            os.remove(part)
+        except OSError:
+            pass
+
+
+def _ink_stats(source, box):
+    """Чернила в рамке на снимке: (их доля в рамке, сколько их, средний цвет)."""
+    x0, y0, x1, y1 = (int(v) for v in box)
+    if x1 - x0 < 3 or y1 - y0 < 3:
+        return 0.0, 0, (0, 0, 0)
+    bg = _background_of(source.crop((max(0, x0 - 2), max(0, y0 - 2),
+                                     min(source.width, x1 + 2), min(source.height, y1 + 2))))[0]
+    inner = source.crop((x0, y0, x1, y1))
+    mask = ImageChops.difference(inner, Image.new("RGB", inner.size, bg)).convert(
+        "L").point(lambda v: 255 if v > INK_TOLERANCE else 0)
+    count = mask.tobytes().count(b"\xff")
+    if not count:
+        return 0.0, 0, (0, 0, 0)
+    return count / ((x1 - x0) * (y1 - y0)), count, tuple(ImageStat.Stat(inner, mask).mean)
+
+
+def _hue_gap(a, b):
+    """Насколько различаются оттенки двух цветов — без яркости: чёрное и серое равны."""
+    return sum(abs((a[i] - sum(a) / 3) - (b[i] - sum(b) / 3)) for i in range(3))
+
+
+def _chinese_text(text):
+    """Текст в основном китайский: иероглифы, без заметной доли каны и хангыля."""
+    letters = [c for c in text if c.isalpha()]
+    cjk = [c for c in letters if _is_cjk(c)]
+    if not letters or len(cjk) < 0.5 * len(letters):
+        return False
+    kana = sum(1 for c in cjk if 0x3040 <= ord(c) <= 0x30FF)
+    hangul = sum(1 for c in cjk if 0xAC00 <= ord(c) <= 0xD7AF or 0x1100 <= ord(c) <= 0x11FF)
+    return kana < 0.1 * len(cjk) and hangul < 0.1 * len(cjk)
+
+
+def _zh_wanted(img):
+    """Читать ли снимок китайским пакетом. Решаем дёшево, до распознавания.
+
+    Язык выбран в меню — слушаемся его. На «авто» спрашиваем определитель
+    письменности: иероглифы — пакет. Неуверенный ответ тоже ведёт к пакету:
+    китайскую витрину определитель называл и латиницей, и корейским. Если
+    пакет прочитает не китайский, его чтение отбросим (см. _zh_lines).
+    """
+    want = str(CFG.get("ocr_langs", "auto") or "auto").strip().lower()
+    if want != "auto":
+        return "chi_sim" in want or "chi_tra" in want
+    scale = float(CFG.get("ocr_scale", 2.0) or 1.0)
+    script, conf = detect_script(preprocess(img, scale))
+    return script in ("Han", "HanS", "HanT") or conf < OSD_MIN_CONF
+
+
+def _zh_lines(img):
+    """Строки китайским пакетом в том же виде, что у _ocr_lines; None — не китайский."""
+    raw = ZhOcr.read(img)
+    if not _chinese_text("".join(l["text"] for l in raw)):
+        log("китайский пакет прочитал не китайский текст — читаем Tesseract-ом")
+        return None
+    source = img.convert("RGB")
+    lines = []
+    for i, item in enumerate(raw):
+        text = BULLET_JUNK.sub("• ", item["text"].strip())
+        if not text:
+            continue
+        x0, y0, x1, y1 = item["box"]
+        lines.append({"text": text, "box": [x0, y0, x1, y1], "text_x0": x0,
+                      "conf": item["score"] * 100, "col": (i, 1),
+                      "ink": _ink_stats(source, (x0, y0, x1, y1))})
+    # Значки RapidOCR читает отдельной строкой: синий квадрат с «R» — «R»,
+    # плашка «失信» — «失信». Выдают их, как и у Tesseract, плотная заливка и
+    # цвет, отличный от ближайшей настоящей надписи.
+    long_lines = [l for l in lines if len(l["text"]) > 2 and l["ink"][1]]
+    keep = []
+    for line in lines:
+        density, count, color = line["ink"]
+        if len(line["text"]) <= 2 and count and density >= ICON_INK and long_lines:
+            cx, cy = (line["box"][0] + line["box"][2]) / 2, (line["box"][1] + line["box"][3]) / 2
+            near = min(long_lines, key=lambda l: abs((l["box"][0] + l["box"][2]) / 2 - cx)
+                       + abs((l["box"][1] + l["box"][3]) / 2 - cy))
+            if _hue_gap(color, near["ink"][2]) >= ICON_COLOR_GAP:
+                log(f"значок вместо букв: {line['text']}")
+                continue
+        keep.append(line)
+    for line in keep:
+        del line["ink"]
+    keep.sort(key=lambda l: (l["box"][1], l["box"][0]))
+    words = [{"x0": int(l["box"][0]), "x1": int(l["box"][2])} for l in keep]
+    median_h = sorted(l["box"][3] - l["box"][1] for l in keep)[len(keep) // 2] if keep else 10
+    gaps = _column_gaps(words, img.width, max(10, int(0.9 * median_h))) if len(keep) > 1 else []
+    return keep, gaps, "chi_sim"
+
+
 def ocr_blocks(img):
     """Распознаём область и возвращаем (полный_текст, [абзацы с координатами])."""
-    lines, gaps, langs = _ocr_lines(img)
+    found = None
+    if ZhOcr.installed() and _zh_wanted(img):
+        try:
+            found = _zh_lines(img)
+        except Exception as e:
+            log(f"китайский пакет не сработал ({e}) — читаем Tesseract-ом")
+    lines, gaps, langs = found or _ocr_lines(img)
     lines = _mark_reach(_mark_cells(lines))
     step = _typical_step(lines)          # обычный шаг строк внутри абзаца
     blocks, skipped = [], 0
@@ -5201,18 +5499,30 @@ class Toast:
     """Небольшая плашка со статусом (например «Распознаю…»)."""
 
     def __init__(self, root, text):
-        vx, vy, vw, vh = virtual_screen_rect()
         self.win = tk.Toplevel(root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", True)
         self.win.attributes("-alpha", 0.92)
         c = theme()
-        tk.Label(self.win, text=text, bg=c["bg"], fg=c["fg"], padx=18, pady=10,
-                 font=("Segoe UI", 11), highlightthickness=1,
-                 highlightbackground=c["line"]).pack()
+        self.label = tk.Label(self.win, text=text, bg=c["bg"], fg=c["fg"], padx=18, pady=10,
+                              font=("Segoe UI", 11), highlightthickness=1,
+                              highlightbackground=c["line"])
+        self.label.pack()
+        self._place()
+
+    def _place(self):
+        vx, vy, vw, vh = virtual_screen_rect()
         self.win.update_idletasks()
         w, h = self.win.winfo_reqwidth(), self.win.winfo_reqheight()
         self.win.geometry(f"+{vx + (vw - w) // 2}+{vy + vh - h - 90}")
+
+    def set(self, text):
+        """Новый текст на той же плашке — ход скачивания и т. п."""
+        try:
+            self.label.configure(text=text)
+            self._place()
+        except Exception:
+            pass
 
     def close(self):
         try:
@@ -5438,6 +5748,8 @@ class App:
         self.busy = False
         self.tray = None
         self.hotkeys = None
+        self._zh_offered = False      # предлагали ли китайский пакет в этот запуск
+        self._zh_busy = False         # пакет сейчас скачивается
         self._pump()
 
     # --- мост «фоновый поток -> главный поток Tk»
@@ -5546,6 +5858,13 @@ class App:
 
             self.post(self._show_result, toast, screen_xy, image, full, text, rerender,
                       translate_all, crop)
+            # Китайский снимок прочитан Tesseract-ом — предлагаем пакет, который
+            # читает иероглифы куда лучше. Раз за запуск и только если не
+            # просили больше не предлагать.
+            if (not ZhOcr.installed() and not self._zh_offered and not self._zh_busy
+                    and CFG.get("zh_pack_offer", True) and _chinese_text(text)):
+                self._zh_offered = True
+                self.post(self._offer_zh_pack)
         except Exception as e:
             traceback.print_exc()
             self.post(self._show_error, toast, screen_xy, f'{tr("error")}: {e}')
@@ -5679,6 +5998,80 @@ class App:
         toast = Toast(self.root, message)
         self.root.after(int(seconds * 1000), toast.close)
 
+    # --- китайский пакет
+    def _offer_zh_pack(self):
+        """Окошко «скачать китайский пакет?» — после перевода китайского снимка."""
+        c = theme()
+        win = tk.Toplevel(self.root)
+        win.title(tr("zh_offer_title"))
+        win.configure(bg=c["bg"])
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        tk.Label(win, text=tr("zh_offer_title"), bg=c["bg"], fg=c["fg"],
+                 font=("Segoe UI", 12), pady=10).pack(padx=18, anchor="w")
+        tk.Label(win, text=tr("zh_offer_text").format(size=ZH_PACK_SIZE_MB), bg=c["bg"],
+                 fg=c["dim"], justify="left", font=("Segoe UI", 10)).pack(padx=18, anchor="w")
+
+        def download():
+            win.destroy()
+            self.download_zh_pack()
+
+        def never():
+            self._save_setting("zh_pack_offer", False)
+            win.destroy()
+
+        row = tk.Frame(win, bg=c["bg"])
+        row.pack(pady=14)
+        for text, cmd, fg, bg in ((tr("zh_download"), download, c["accent_fg"], c["accent"]),
+                                  (tr("zh_later"), win.destroy, c["btn"], c["hover_active"]),
+                                  (tr("zh_never"), never, c["btn"], c["hover_active"])):
+            b = tk.Label(row, text=text, bg=bg, fg=fg, font=("Segoe UI", 10),
+                         padx=18, pady=6, cursor="hand2")
+            b.pack(side="left", padx=6)
+            b.bind("<Button-1>", lambda e, cmd=cmd: cmd())
+        win.bind("<Escape>", lambda e: win.destroy())
+        win.update_idletasks()
+        mx, my, mw, mh = monitor_rect_at(win.winfo_pointerx(), win.winfo_pointery())
+        win.geometry("+%d+%d" % (mx + (mw - win.winfo_width()) // 2,
+                                 my + (mh - win.winfo_height()) // 3))
+
+    def download_zh_pack(self):
+        """Скачать и поставить китайский пакет — в фоне, с ходом скачивания на плашке."""
+        if self._zh_busy:
+            return
+        self._zh_busy = True
+        toast = Toast(self.root, tr("zh_progress").format(pct=0))
+
+        def say(text):
+            toast.set(text)
+
+        def done(message):
+            toast.close()
+            self._zh_busy = False
+            self._flash(message, 4.0)
+
+        def work():
+            try:
+                install_zh_pack(lambda pct: self.post(say, tr("zh_progress").format(pct=pct)),
+                                lambda: self.post(say, tr("zh_installing")))
+                self.post(done, tr("zh_done"))
+            except Exception as e:
+                traceback.print_exc()
+                self.post(done, tr("zh_failed").format(err=e))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def remove_zh_pack(self):
+        ZhOcr.stop()
+        shutil.rmtree(ZH_PACK_DIR, ignore_errors=True)
+        self._flash(tr("zh_removed"))
+
+    def _zh_menu_click(self):
+        if ZhOcr.installed():
+            self.remove_zh_pack()
+        else:
+            self.download_zh_pack()
+
     # --- горячие клавиши
     def start_hotkeys(self):
         mapping = {
@@ -5757,6 +6150,9 @@ class App:
                              checked=lambda item: autostart_enabled()),
             pystray.MenuItem(lambda _: tr("menu_hotkeys"),
                              lambda: self.post(self._ask_hotkeys)),
+            pystray.MenuItem(lambda _: tr("zh_menu_remove") if ZhOcr.installed()
+                             else tr("zh_menu_get").format(size=ZH_PACK_SIZE_MB),
+                             lambda: self.post(self._zh_menu_click)),
             pystray.MenuItem(lambda _: tr("settings"), lambda: os.startfile(CONFIG_PATH)),
             pystray.MenuItem(lambda _: tr("quit"), self.quit),
             pystray.Menu.SEPARATOR,
@@ -6171,6 +6567,7 @@ class App:
         return hotkey.replace("<", "").replace(">", "").replace("+", "+").title()
 
     def quit(self, *_):
+        ZhOcr.stop()
         if self.tray:
             try:
                 self.tray.stop()
@@ -6312,6 +6709,16 @@ def selftest():
             spare = "без pynput (не страшно)"
         return f"окно рисуется, трей и {spare}"
 
+    def check_zh():
+        """Китайский пакет необязателен: нет его — не ошибка, а пояснение."""
+        if not ZhOcr.installed():
+            return "не установлен — необязательно, программа предложит его на китайском снимке"
+        try:
+            ZhOcr.read(Image.new("RGB", (120, 40), "white"))
+        finally:
+            ZhOcr.stop()
+        return f"установлен и отвечает ({ZH_PACK_DIR})"
+
     print("Экранный переводчик — самопроверка")
     print(f"папка программы : {APP_DIR}")
     print(f"файлы настроек  : {DATA_DIR}")
@@ -6328,6 +6735,7 @@ def selftest():
     step("Редкие знаки валют", check_signs)
     step("Курсы валют", check_rates)
     step("Окно и иконка в трее", check_gui)
+    step("Китайский пакет", check_zh)
 
     print()
     if failed:
