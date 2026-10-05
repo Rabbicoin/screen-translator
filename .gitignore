@@ -32,6 +32,8 @@ tests/bench/shots/
 tests/bench/bench_*.json
 tests/bench/*.pkl
 tests/bench/trace.png
+# стенд разметки (blocks.py): в прогонах тексты с чужих экранов
+tests/bench/blocks_*.json
 
 # Локальные настройки Claude Code — своё для каждого компьютера
 .claude/

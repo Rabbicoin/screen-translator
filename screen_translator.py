@@ -1761,6 +1761,266 @@ def _ruled_apart(rules, a, b):
     return False
 
 
+# Кнопка с тёмной заливкой — «Start advertising on ChatGPT» белым по чёрному
+# справа от абзаца — сама читается хорошо, но может сбить Tesseract-у разбор
+# макета: строка кнопки стоит по высоте между первой и второй строками абзаца,
+# и он тянет её «строку» поперёк абзаца, через пустой промежуток между его
+# строками. В этой строке выходили обрывки соседей — «macy» с уверенностью 81,
+# «your Sugg» поверх «your suggested», — а у настоящей первой строки пропадала
+# середина, и она рвалась на два блока. Перевод ложился тремя слоями мелкого
+# текста, кнопка — кусками: «Начать рекламу», «ng on C», «шапкаGPT». Без кнопки
+# абзац читается слово в слово, а кнопка, вырезанная отдельно, — тоже: «Start
+# advertising on ChatGPT» на 90–96. Тогда кнопки вынимаем со снимка и читаем
+# каждую отдельно — но только тогда, см. plaque_trouble.
+#
+# Кнопка — сплошная заливка, заметно темнее (или светлее) фона страницы, с
+# одной строкой текста внутри и полями заливки вокруг неё. Светлая плашка на
+# белом («Add to Cart» жёлтым на Amazon) разбору не мешает — после перевода в
+# серое она такая же светлая, как фон, — и её не трогаем. Не трогаем и
+# выделенное слово посреди фразы: у него вплотную слева или справа стоит текст,
+# и вынутое, оно оторвалось бы от своего предложения.
+PLAQUE_CONTRAST = 100        # разница яркости заливки и фона страницы
+PLAQUE_CELL = 4              # клетка огрубления: в ней сплошная заливка, а не штрих буквы
+PLAQUE_MIN_H = 14
+PLAQUE_MAX_H = 120
+PLAQUE_MAX = 12              # каждую кнопку читаем отдельно — это время
+PLAQUE_BLOCK = 2000          # номер блока строк, прочитанных с кнопок
+
+_INK_RUN = re.compile(rb"\xff+")
+
+
+def _luma(color):
+    return 0.299 * color[0] + 0.587 * color[1] + 0.114 * color[2]
+
+
+def _solid_spots(mask):
+    """Связные пятна белого на маске (байты 0/255): рамки (x0, y0, x1, y1).
+
+    Ищем по отрезкам строк: отрезок, перекрывающий отрезок строки выше,
+    принадлежит тому же пятну. Маска огрублённая — отрезков немного.
+    """
+    width, height = mask.size
+    data = mask.tobytes()
+    parent = {}
+
+    def root(run):
+        while parent[run] != run:
+            parent[run] = parent[parent[run]]
+            run = parent[run]
+        return run
+
+    above, runs = [], []
+    for y in range(height):
+        here = []
+        for m in _INK_RUN.finditer(data, y * width, (y + 1) * width):
+            run = (y, m.start() - y * width, m.end() - y * width)
+            parent[run] = run
+            for prev in above:
+                if prev[1] < run[2] and run[1] < prev[2]:
+                    a, b = root(prev), root(run)
+                    if a != b:
+                        parent[b] = a
+            here.append(run)
+        runs.extend(here)
+        above = here
+    boxes = {}
+    for y, x0, x1 in runs:
+        box = boxes.setdefault(root((y, x0, x1)), [x0, y, x1, y + 1])
+        box[0], box[1] = min(box[0], x0), min(box[1], y)
+        box[2], box[3] = max(box[2], x1), max(box[3], y + 1)
+    return list(boxes.values())
+
+
+def _counts(mask, columns=False):
+    """Сколько белого на маске в каждой строке (или в каждом столбце)."""
+    if columns:
+        mask = mask.transpose(Image.TRANSPOSE)
+    width, height = mask.size
+    data = mask.tobytes()
+    return [data.count(b"\xff", i * width, (i + 1) * width) for i in range(height)]
+
+
+def _plaque_text(src, box, page_bg, others):
+    """Заливка и полоса текста кнопки в рамке box — или None, если это не кнопка."""
+    width, height = src.size
+    x0, y0, x1, y1 = box
+    w, h = x1 - x0, y1 - y0
+    if (not PLAQUE_MIN_H <= h <= PLAQUE_MAX_H or w < 1.5 * h
+            or x0 < 1 or y0 < 1 or x1 > width - 1 or y1 > height - 1
+            or w * h > 0.5 * width * height):
+        return None
+    crop = src.crop(box)
+    # Цвет заливки — самый частый внутри, а не по краю рамки: край у кнопки
+    # сглажен, и при масштабе 90 % «фоном» по краю выходил серый.
+    fill = max(crop.getcolors(w * h))[1]
+    if abs(_luma(fill) - _luma(page_bg)) < PLAQUE_CONTRAST:
+        return None
+    ink = ImageChops.difference(crop, Image.new("RGB", crop.size, fill)).convert("L").point(
+        lambda v: 255 if v > INK_TOLERANCE else 0)
+    # Полосу текста ищем по середине кнопки: скруглённые углы — это фон
+    # страницы, и по краям он вышел бы «чернилами» в верхних и нижних рядах.
+    radius = h // 2
+    rows = _counts(ink.crop((radius, 2, w - radius, h - 2)))
+    runs, start = [], None
+    for i, n in enumerate(rows + [0]):
+        if n and start is None:
+            start = i
+        elif not n and start is not None:
+            runs.append((start + 2, i + 2))
+            start = None
+    if not runs:
+        return None
+    # Строка текста одна. Точка над «i» и знаки над буквами отделены пустым
+    # рядом от самой строки — это не вторая строка: они много ниже её.
+    tallest = max(b - a for a, b in runs)
+    if sum(1 for a, b in runs if b - a > 0.3 * tallest) != 1:
+        return None
+    top, bottom = runs[0][0], runs[-1][1]
+    # и вокруг неё поля заливки
+    if top < 3 or bottom > h - 3 or not 5 <= bottom - top <= 0.8 * h:
+        return None
+    # Края текста мерим по середине строки: ниже, у хвостов «g» и «y», у
+    # крупной кнопки уже начинается скругление угла, и фон страницы в нём
+    # выходил «текстом у самого края».
+    quarter = (bottom - top) // 4
+    cols = _counts(ink.crop((2, top + quarter, w - 2, bottom - quarter)), columns=True)
+    inked = [i + 2 for i, n in enumerate(cols) if n]
+    if not inked or inked[0] < 4 or inked[-1] > w - 5:
+        return None
+    # Сама по себе на своей высоте: вплотную слева и справа нет текста.
+    # Соседняя кнопка не в счёт — ряд кнопок стоит тесно.
+    margin = max(4, h // 2)
+    for zx0, zx1 in ((max(0, x0 - margin), x0 - 1), (x1 + 1, min(width, x1 + margin))):
+        if zx1 <= zx0:
+            continue
+        zone = ImageChops.difference(src.crop((zx0, y0, zx1, y1)),
+                                     Image.new("RGB", (zx1 - zx0, h), page_bg)).convert("L").point(
+            lambda v: 255 if v > INK_TOLERANCE else 0)
+        draw = ImageDraw.Draw(zone)
+        for o in others:
+            if o[0] < zx1 and zx0 < o[2] and o[1] < y1 and y0 < o[3]:
+                draw.rectangle((o[0] - zx0, o[1] - y0, o[2] - zx0 - 1, o[3] - y0 - 1), fill=0)
+        if zone.tobytes().count(b"\xff") > 0.02 * (zx1 - zx0) * h:
+            return None
+    # запас вбок — на кавычку или апостроф, что выше середины строки
+    pad = max(2, quarter)
+    return fill, (max(2, inked[0] - pad), top - 1, min(w - 2, inked[-1] + 1 + pad), bottom + 1)
+
+
+def find_plaques(img):
+    """Кнопки с заливкой на снимке (см. выше): [(рамка, вырезка, рамка текста)].
+
+    В вырезке всё вокруг текста залито цветом кнопки, а светлые буквы на
+    тёмном перевёрнуты в тёмные на светлом — так Tesseract читает её как
+    обычную строку.
+    """
+    width, height = img.size
+    page_bg = dominant_color(img)
+    level = _luma(page_bg)
+    far = img.convert("L").point(lambda v: 255 if abs(v - level) >= PLAQUE_CONTRAST else 0)
+    # Сплошная заливка — то, что остаётся при огрублении клетками: штрих
+    # буквы тоньше клетки, и клетка с ним выходит серой, а не белой.
+    core = far.reduce(PLAQUE_CELL).point(lambda v: 255 if v >= 250 else 0)
+    found = []
+    for cx0, cy0, cx1, cy1 in _solid_spots(core):
+        if cx1 - cx0 < 3 or (cy1 - cy0) * PLAQUE_CELL < PLAQUE_MIN_H // 2:
+            continue
+        # Края заливки уточняем по пикселям: ряды и столбцы, где она занимает
+        # хоть четверть. Клетка огрубления их не видит, а при вырезании нужны
+        # точные: недорезанный край кнопки читался бы скобкой.
+        rx0, ry0 = max(0, (cx0 - 1) * PLAQUE_CELL), max(0, (cy0 - 1) * PLAQUE_CELL)
+        rx1, ry1 = min(width, (cx1 + 1) * PLAQUE_CELL), min(height, (cy1 + 1) * PLAQUE_CELL)
+        region = far.crop((rx0, ry0, rx1, ry1))
+        rows = [i for i, n in enumerate(_counts(region)) if n >= 0.25 * (rx1 - rx0)]
+        if not rows:
+            continue
+        y0, y1 = rows[0], rows[-1] + 1
+        cols = [i for i, n in enumerate(_counts(region.crop((0, y0, rx1 - rx0, y1)), columns=True))
+                if n >= 0.25 * (y1 - y0)]
+        if cols:
+            found.append((rx0 + cols[0], ry0 + y0, rx0 + cols[-1] + 1, ry0 + y1))
+    plaques = []
+    for box in found:
+        if len(plaques) >= PLAQUE_MAX:
+            break
+        # одна кнопка иногда даёт два пятна, вложенных одно в другое
+        if any(box[0] < b[2] and b[0] < box[2] and box[1] < b[3] and b[1] < box[3]
+               for b, _, _ in plaques):
+            continue
+        # заливка — хотя бы половина рамки, остальное — буквы и углы
+        if far.crop(box).tobytes().count(b"\xff") < 0.5 * (box[2] - box[0]) * (box[3] - box[1]):
+            continue
+        text = _plaque_text(img, box, page_bg, [b for b in found if b is not box])
+        if text is None:
+            continue
+        fill, (tx0, ty0, tx1, ty1) = text
+        cut = Image.new("RGB", (box[2] - box[0], box[3] - box[1]), fill)
+        cut.paste(img.crop((box[0] + tx0, box[1] + ty0, box[0] + tx1, box[1] + ty1)), (tx0, ty0))
+        if _luma(fill) < 128:
+            cut = ImageOps.invert(cut)
+        plaques.append((box, cut, (box[0] + tx0, box[1] + ty0, box[0] + tx1, box[1] + ty1)))
+    return plaques
+
+
+def lift_plaques(img, plaques):
+    """Снимок, на котором кнопки залиты тем, что вокруг них."""
+    width, height = img.size
+    img = img.copy()
+    draw = ImageDraw.Draw(img)
+    for (x0, y0, x1, y1), _, _ in plaques:
+        ring = img.crop((max(0, x0 - 3), max(0, y0 - 3), min(width, x1 + 3), min(height, y1 + 3)))
+        draw.rectangle((x0 - 1, y0 - 1, x1, y1), fill=_background_of(ring)[0])
+    return img
+
+
+def plaque_trouble(lines, plaques, scale):
+    """Кнопка сбила разбор строк. Признаков три, хватит любого.
+
+    Слова строки кнопки, стоящие вне её, лежат поверх слов другой строки:
+    одни и те же пиксели прочитаны дважды («your» над «your»). Или стоят не в
+    ряд с текстом кнопки: при масштабе 125 % первая строка абзаца целиком
+    вошла в строку кнопки, хотя стоит выше неё, — и середина строки читалась
+    мусором («ait», «ity»), а «website» пропало. Или текст кнопки не прочитан
+    вовсе: при 90 % Tesseract счёл её картинкой и потерял весь абзац рядом.
+
+    Кнопка в ряд с соседями («Add file» и «Code» на GitHub) ничего этого не
+    делает — тогда снимок читаем как есть: вынутая кнопка меняет разбор всей
+    страницы, и где-то он выходит хуже.
+    """
+    def centre(w):
+        return (w["x0"] + w["x1"]) / 2, (w["y0"] + w["y1"]) / 2
+
+    for box, _, (tx0, ty0, tx1, ty1) in plaques:
+        x0, y0, x1, y1 = (v * scale for v in box)
+
+        def inside(w):
+            cx, cy = centre(w)
+            return x0 <= cx <= x1 and y0 <= cy <= y1
+
+        mine = [key for key, words in lines.items() if any(inside(w) for w in words)]
+        if not mine:
+            if tx1 - tx0 >= 2 * (ty1 - ty0):     # текст, а не один значок
+                return True
+            continue
+        for key in mine:
+            for w in lines[key]:
+                if inside(w):
+                    continue
+                if not ty0 * scale <= centre(w)[1] <= ty1 * scale:
+                    return True
+                area = (w["x1"] - w["x0"]) * (w["y1"] - w["y0"])
+                for other, theirs in lines.items():
+                    if other == key:
+                        continue
+                    for o in theirs:
+                        dx = min(w["x1"], o["x1"]) - max(w["x0"], o["x0"])
+                        dy = min(w["y1"], o["y1"]) - max(w["y0"], o["y0"])
+                        least = min(area, (o["x1"] - o["x0"]) * (o["y1"] - o["y0"]))
+                        if dx > 0 and dy > 0 and dx * dy >= 0.3 * max(1, least):
+                            return True
+    return False
+
+
 def _column_gaps(words, width, min_gap):
     """Сквозные вертикальные «рвы» — пустые полосы между колонками и карточками.
 
@@ -1968,11 +2228,13 @@ class _ZhHint(Exception):
     """Первая попытка Tesseract не прочла заметную часть надписей — похоже на иероглифы."""
 
 
-def _ocr_lines(img, zh_check=False):
+def _ocr_lines(img, zh_check=False, lift=False):
     """Распознанные строки: [{text, box, conf, col}], сверху вниз.
 
     Строку режем на части там, где между словами большой горизонтальный провал —
     иначе текст из соседних колонок (карточек) склеивается в одну кашу.
+
+    lift — читать снимок без кнопок с заливкой, а их — отдельно (plaque_trouble).
     """
     scale = cfg_scale = float(CFG.get("ocr_scale", 2.0) or 1.0)
     # для однострочных полосок psm 7 (одна строка) точнее, чем разметка страницы
@@ -1981,6 +2243,11 @@ def _ocr_lines(img, zh_check=False):
     # и линеек, см. erase_rules.
     source = img.convert("RGB")
     img, rules = erase_rules(source)
+    # В однострочной полоске разбирать нечего, и кнопке сбивать там нечего
+    plaques = find_plaques(img) if psm != 7 else []
+    if lift and plaques:
+        img = lift_plaques(img, plaques)
+        log(f"кнопок с заливкой: {len(plaques)}, читаем их отдельно")
     prepared = preprocess(img, scale)
 
     def read(langs, mode=None):
@@ -2060,6 +2327,13 @@ def _ocr_lines(img, zh_check=False):
             lines, langs, best_kept, garbled = found, attempt, kept, read.garbled
         if kept and dropped <= max(1, kept * 0.25):
             break                      # прочитали уверенно, дальше искать нечего
+
+    # Кнопка с заливкой сбила разбор (см. plaque_trouble) — читаем заново без
+    # кнопок. Проверяем сразу после основного прохода: дальше по сбитому
+    # разбору читать нечего, а время на этот проход и так ушло.
+    if not lift and plaques and plaque_trouble(lines, plaques, scale):
+        log("кнопка с заливкой сбила разбор строк — читаем снимок без неё")
+        return _ocr_lines(source, lift=True)
 
     # Определитель письменности ошибается и на больших снимках: китайскую
     # витрину с фотографиями товаров он назвал латиницей с уверенностью 0.1.
@@ -2211,6 +2485,20 @@ def _ocr_lines(img, zh_check=False):
         prepared = whole
         log(f"полос с неуверенными словами: {len(bands)}, перечитано "
             f"{min(len(bands), GARBLED_BANDS_MAX)}, добавлено слов {added}")
+
+    # Вынутые кнопки читаем по одной, как однострочную полоску, и ставим на
+    # место отдельными строками. Масштаб — тот, что выиграл у основного прохода.
+    if lift and plaques:
+        whole = prepared
+        for i, ((x0, y0, _, _), cut, _) in enumerate(plaques):
+            prepared = preprocess(cut, scale)
+            found, _, _ = read(langs, 7)
+            dx, dy = round(x0 * scale), round(y0 * scale)
+            words = [dict(w, x0=w["x0"] + dx, x1=w["x1"] + dx, y0=w["y0"] + dy, y1=w["y1"] + dy)
+                     for ws in found.values() for w in ws]
+            if words:
+                lines[(PLAQUE_BLOCK + i, 1, 1)] = words
+        prepared = whole
 
     # Второй проход: узкий набор языков поверх выбранного. Нужен только на
     # смешанном тексте — там смешанный набор путает кириллицу с латиницей.
