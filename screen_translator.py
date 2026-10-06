@@ -2229,13 +2229,15 @@ class _ZhHint(Exception):
     """Первая попытка Tesseract не прочла заметную часть надписей — похоже на иероглифы."""
 
 
-def _ocr_lines(img, zh_check=False, lift=False):
+def _ocr_lines(img, zh_check=False, lift=False, only_langs=None):
     """Распознанные строки: [{text, box, conf, col}], сверху вниз.
 
     Строку режем на части там, где между словами большой горизонтальный провал —
     иначе текст из соседних колонок (карточек) склеивается в одну кашу.
 
-    lift — читать снимок без кнопок с заливкой, а их — отдельно (plaque_trouble).
+    lift — читать снимок без кнопок с заливкой, а их — отдельно (plaque_trouble);
+    only_langs — набор языков, уже выбранный для этого снимка: перебирать заново
+    незачем.
     """
     scale = cfg_scale = float(CFG.get("ocr_scale", 2.0) or 1.0)
     # для однострочных полосок psm 7 (одна строка) точнее, чем разметка страницы
@@ -2264,6 +2266,9 @@ def _ocr_lines(img, zh_check=False, lift=False):
                                f"Проверьте, что они установлены.")
         found, weak, dropped = {}, {}, 0
         read.garbled = []
+        # Рамки слов, какой бы ни вышел текст: их находит разбор макета, а
+        # он от языка не зависит (см. перебор наборов ниже)
+        read.boxes = data["level"].count(5)
         for i in range(len(data["text"])):
             word = (data["text"][i] or "").strip()
             try:
@@ -2310,7 +2315,7 @@ def _ocr_lines(img, zh_check=False, lift=False):
     # а на смешанной картинке её вообще нельзя выбрать одну на всех. Поэтому
     # пробуем наборы по очереди и берём тот, что прочитал больше слов. Много
     # отброшенных слов — признак, что там текст на неохваченной письменности.
-    candidates = ocr_lang_candidates(prepared)
+    candidates = [only_langs] if only_langs else ocr_lang_candidates(prepared)
     lines, langs, best_kept, garbled = {}, candidates[0], -1, []
     for attempt in candidates:
         found, kept, dropped = read(attempt)
@@ -2328,13 +2333,22 @@ def _ocr_lines(img, zh_check=False, lift=False):
             lines, langs, best_kept, garbled = found, attempt, kept, read.garbled
         if kept and dropped <= max(1, kept * 0.25):
             break                      # прочитали уверенно, дальше искать нечего
+        # Не нашлось ни одной рамки слова — другой набор языков не найдёт их
+        # тоже: строки и слова ищет разбор макета, язык нужен только чтобы их
+        # прочесть. Иначе снимок одной тёмной кнопки «Confirm» читался ещё и
+        # набором из двадцати языков — полторы секунды впустую. Ничего не
+        # прочитать при найденных рамках — другое дело: так «eng+rus» видит
+        # иероглифы (пять рамок, текст пустой), и тогда перебор нужен.
+        if not read.boxes:
+            break
 
     # Кнопка с заливкой сбила разбор (см. plaque_trouble) — читаем заново без
     # кнопок. Проверяем сразу после основного прохода: дальше по сбитому
-    # разбору читать нечего, а время на этот проход и так ушло.
+    # разбору читать нечего, а время на этот проход и так ушло. Языки уже
+    # выбраны — второй раз их не перебираем.
     if not lift and plaques and plaque_trouble(lines, plaques, scale):
         log("кнопка с заливкой сбила разбор строк — читаем снимок без неё")
-        return _ocr_lines(source, lift=True)
+        return _ocr_lines(source, lift=True, only_langs=langs)
 
     # Определитель письменности ошибается и на больших снимках: китайскую
     # витрину с фотографиями товаров он назвал латиницей с уверенностью 0.1.
