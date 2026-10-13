@@ -239,6 +239,22 @@ CASES = [
     ("$24.99|$14.99", "dark:1.25:0:3", "auto", [(24.99, "USD", True), (14.99, "USD", False)]),
     ("$29.99|$19.99", "dark:1.5:0:12", "auto", [(29.99, "USD", True), (19.99, "USD", False)]),
     ("$24.99|$14.99", "dark:1.5:0.6:3", "auto", [(24.99, "USD", True), (14.99, "USD", False)]),
+    # Переписка: сумма словами, мелкая монета, слово валюты на другой строке
+    # («chat» — строки через «|», как перенёс их чат)
+    ("Red one 78 cents. Greenish one 90|cents. If you want cap then 15 cents|more", "chat",
+     "auto", [(0.78, "USD", False), (0.9, "USD", False), (0.15, "USD", False)]),
+    ("Red one 78 cents. Greenish one 90|cents. If you want cap then 15 cents|more", "chat",
+     "EUR", [(0.78, "EUR", False), (0.9, "EUR", False), (0.15, "EUR", False)]),
+    ("It is 1 dollar 50 cents per piece", "", "auto", [(1.5, "USD", False)]),
+    ("10-15 cents more", "", "auto", [(0.1, "USD", False), (0.15, "USD", False)]),
+    ("Only 99¢ today", "big", "auto", [(0.99, "USD", False)]),
+    ("Цена 99 руб. 90 коп.", "", "auto", [(99.9, "RUB", False)]),
+    ("Final price is Rs|450 per piece", "chat", "auto", [(450, "INR", False)]),
+    ("500 rs per kg, shipping 20 usd", "", "auto", [(500, "INR", False), (20, "USD", False)]),
+    ("Pay 5 bucks or 300 rupee", "", "auto", [(5, "USD", False), (300, "INR", False)]),
+    ("Size 10|USD 14.99", "chat", "auto", [(14.99, "USD", False)]),
+    ("Width 5 centimeters", "", "auto", []),
+    ("Page 2|Center", "chat", "auto", []),
 ]
 
 
@@ -319,6 +335,15 @@ def draw_case(text, style):
         w = d.textlength(main, font=f1)
         d.text((pad + w + 1, pad + 3), cents, font=f2, fill=ink)
         right, bottom = pad + w + 1 + d.textlength(cents, font=f2), pad + 42
+    elif style == "chat":
+        # сообщение в чате: несколько строк одним шрифтом, как их перенёс чат
+        rows = text.split("|")
+        f = _font(text, 15)
+        img = Image.new("RGB", (600, 20 * len(rows) + 2 * pad), "white")
+        d = ImageDraw.Draw(img)
+        for n, row in enumerate(rows):
+            d.text((pad, pad + n * 20), row, font=f, fill=ink)
+        right, bottom = pad + max(d.textlength(row, font=f) for row in rows), pad + 20 * len(rows)
     elif style == "strike":
         old, new = text.split(" ", 1)
         f1, f2 = _font(old, 15), _font(new, 22, True)

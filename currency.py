@@ -167,10 +167,21 @@ RUPEES = ("INR", "PKR", "LKR", "NPR")
 _MONEY = re.compile(r"[.,]\d{2}$")                              # «79,99»
 _LAKH = re.compile(r"^\d{1,2}(?:,\d\d)+,\d{3}(?:\.\d\d)?$")     # «1,23,456.00»
 
+# Мелкая монета словом — так суммы пишут в переписке: «Red one 78 cents» — это
+# $0,78. Сумма у такой метки — сотая доля валюты. Центы бывают и у евро, но
+# по умолчанию это доллар США, как и одиночный «$».
+_SUBUNIT_SPEC = [
+    (["cents", "cent", "¢"], DOLLARS + ("EUR",)),
+    # «kon.» — так «коп.» читает распознавание, как «руб» — «py6»
+    (["копеек", "копейки", "копейка", "коп.", "коп", "kon.", "kon"], ("RUB",)),
+    (["paise", "paisa"], ("INR",)),
+]
+
 _MARKER_SPEC = [
     # --- доллары
-    (["$", "долл.", "долл", "доллар", "доллара", "долларов", "dollars"], DOLLARS, "any", False),
-    (["US$", "U$S", "$US"], ("USD",), "any", False),
+    (["$", "долл.", "долл", "доллар", "доллара", "долларов", "dollars", "dollar", "bucks"],
+     DOLLARS, "any", False),
+    (["US$", "U$S", "$US", "usd"], ("USD",), "any", False),
     # «S$» распознавание читает как «$$»: две одинаковые буквы-змейки
     (["S$", "SG$", "$$"], ("SGD",), "any", False),
     (["A$", "AU$"], ("AUD",), "any", False),
@@ -183,9 +194,10 @@ _MARKER_SPEC = [
     (["MX$", "Mex$"], ("MXN",), "any", False),
     (["R$"], ("BRL",), "any", False),
     # --- евро, фунт, рубль
-    (["€", "euro", "euros", "евро"], ("EUR",), "any", False),
+    (["€", "euro", "euros", "евро", "eur"], ("EUR",), "any", False),
     (["£"], ("GBP",), "any", False),
     (["₽", "руб", "руб.", "Руб", "Руб.", "РУБ", "рубль", "рубля", "рублей",
+      "rubles", "ruble", "roubles", "rouble",
       # так рубли читает английская модель распознавания
       "py6", "py6.", "pyб", "pyб.", "pуб", "pуб."], ("RUB",), "any", False),
     # «₽» распознавание отдаёт латинской или русской «P», бывает с «°» спереди
@@ -193,23 +205,23 @@ _MARKER_SPEC = [
     # перед числом та же «P» — песо, ниже.
     (["р.", "p.", "°P", "P", "Р", "р"], ("RUB",), "post", False),
     # --- рупии
-    (["₹"], ("INR",), "any", False),
+    (["₹", "inr"], ("INR",), "any", False),
     # «₹» читается как «%». Но и настоящий процент перед ценой бывает — скидка
     # «-15% 1 299 ₽»; как их различаем — в _marker_before и find_prices.
     (["%"], ("INR",), "pre", False),
-    (["Rs", "Rs.", "RS", "RS.", "₨", "rupees"], RUPEES, "any", False),
+    (["Rs", "Rs.", "RS", "RS.", "₨", "rupees", "rupee", "rs", "rs."], RUPEES, "any", False),
     (["Rp", "Rp."], ("IDR",), "any", False),
     (["RM"], ("MYR",), "any", False),
     # --- Азия
     (["¥", "yen"], YENS, "any", False),
-    (["元", "RMB", "CN¥", "юань", "юаня", "юаней", "yuan"], ("CNY",), "any", False),
+    (["元", "RMB", "CN¥", "юань", "юаня", "юаней", "yuan", "rmb"], ("CNY",), "any", False),
     (["円", "JP¥"], ("JPY",), "any", False),
     (["₩", "원"], ("KRW",), "any", False),
     (["฿", "บาท"], ("THB",), "any", False),
     (["₫", "đ", "vnđ", "VNĐ"], ("VND",), "any", False),
     (["₱"], ("PHP",), "any", False),
     (["₪", "NIS"], ("ILS",), "any", False),
-    (["Dhs", "Dhs.", "Dh", "د.إ"], ("AED",), "any", False),
+    (["Dhs", "Dhs.", "Dh", "د.إ", "dirhams", "dirham", "aed"], ("AED",), "any", False),
     (["ر.س"], ("SAR",), "any", False),
     (["E£"], ("EGP",), "any", False),
     # --- СНГ и рядом
@@ -239,6 +251,8 @@ _MARKER_SPEC = [
     (["₮"], ("MNT",), "any", False),
     (["₿"], ("BTC",), "any", False),
     (["USDC"], ("USDT",), "any", False),
+    # --- мелкая монета словом: «78 cents», «90 коп.»
+    *[(tokens, codes, "post", False) for tokens, codes in _SUBUNIT_SPEC],
     # --- двойники: во что распознавание превращает «€» и «₹». Сами по себе
     # эти значки о деньгах не говорят («© 2024», «~15 мин»), поэтому верим им,
     # только когда число рядом записано как деньги: с копейками («79,99 ©»)
@@ -283,6 +297,10 @@ def _build_markers():
 MARKERS = _build_markers()
 _PRE = sorted({t for t, s in MARKERS if s == "pre"}, key=len, reverse=True)
 _POST = sorted({t for t, s in MARKERS if s == "post"}, key=len, reverse=True)
+# метки мелкой монеты во всех написаниях, что попали в MARKERS
+SUBUNITS = {v for tokens, _ in _SUBUNIT_SPEC for t in tokens for v in (t, t.translate(_CYR_TWIN))}
+# «1 dollar 50 cents», «99 руб. 90 коп.» — между целыми и мелкой монетой
+_SUBUNIT_LINK = re.compile(r"^\s?(?:,|and|&|и)?\s?$", re.IGNORECASE)
 
 # Множители после числа: «$1.2M», «12,5 тыс. ₽». Два последних написания в
 # каждой строке — как распознавание читает русские «тыс.» и «млн» без
@@ -452,6 +470,56 @@ def _multiplier_after(text, pos):
     return None
 
 
+def _rows_below(lines):
+    """Какая строка идёт сразу под какой: {номер строки: номер строки под ней}.
+
+    Под ней — значит, начинается не дальше высоты строки ниже её и стоит в
+    той же колонке (по ширине перекрываются). Соседняя колонка или карточка
+    на той же высоте — не продолжение текста.
+    """
+    boxes = [(min(w["box"][0] for w in ln), min(w["box"][1] for w in ln),
+              max(w["box"][2] for w in ln), max(w["box"][3] for w in ln)) for ln in lines]
+    below = {}
+    for i, (x0, y0, x1, y1) in enumerate(boxes):
+        h = max(1, y1 - y0)
+        near = [(b[1], j) for j, b in enumerate(boxes)
+                if j != i and y1 - 0.3 * h <= b[1] <= y1 + h and b[0] < x1 and x0 < b[2]]
+        if near:
+            below[i] = min(near)[1]
+    return below
+
+
+def _wrapped_mark(norms, j, side):
+    """Метка валюты, которую перенос строки оторвал от числа: (метка, где в строке `j`) или None.
+
+    Чат переносит текст как придётся, и «Greenish one 90 cents.» рвётся
+    между числом и словом: «90» в конце строки, «cents.» — в начале следующей
+    (`side` = "post", `j` — строка под числом), или «Rs» в конце строки над
+    числом («pre»). Верим только слову или коду валюты: знак и буква у края
+    строки («P», «T», «$») значат что угодно.
+    """
+    text = norms[j]
+    if side == "post":
+        at = len(text) - len(text.lstrip())
+        found = _marker_after(text, at)
+        # «Size 10 / USD 14.99» — код у следующего числа, а не у этого
+        if not found or re.match(r" ?\d", text[found[1]:]):
+            return None
+        # стирать слово — так с точкой за ним: «cents.»
+        span = (at, found[1] + len(re.match(r"[.,;:!?]*", text[found[1]:]).group()))
+    else:
+        end = len(text.rstrip())
+        found = _marker_before(text, end)
+        # «500 Rs / 200» — знак предыдущего числа
+        if not found or re.search(r"\d ?$", text[:found[1]]):
+            return None
+        span = (found[1], end)
+    word = found[0].rstrip(".")
+    if word.isalpha() and (len(word) >= 3 or word.lower() == "rs"):
+        return found[0], span
+    return None
+
+
 def _resolve(codes, weak, source, context):
     """Метка -> код валюты с учётом выбранной «валюты на экране» и соседнего текста."""
     if source and source != "auto" and source in codes:
@@ -522,6 +590,7 @@ class Price:
         self.weak = weak          # валюта не по знаку, а по выбору человека
         self.short = short        # записана с множителем: «$1.2M», «12,5 тыс. ₽»
         self.digits_x = (box[0], box[2])   # где по x стоят сами цифры, без знака валюты
+        self.extra = []           # слово валюты на соседней строке («90 / cents.») — стереть
 
     def __repr__(self):
         return f"Price({self.amount:g} {self.code}, {self.text!r}{', old' if self.strike else ''})"
@@ -535,10 +604,14 @@ def find_prices(lines, source="auto"):
     общий знак («$», «¥», «kr»), слабые метки и числа без знака вовсе.
     """
     context = " ".join(w["text"] for line in lines for w in line)
+    texts = [_line_text(line) for line in lines]
+    norms = [text.translate(_NORM) for text, _ in texts]
+    below = _rows_below(lines)
+    above = {j: i for i, j in below.items()}
     found = []
-    for line in lines:
-        text, spans = _line_text(line)
-        norm = text.translate(_NORM)
+    for li, line in enumerate(lines):
+        text, spans = texts[li]
+        norm = norms[li]
         nums = []
         taken = 0                   # до сюда строка уже разобрана: копейки «19€99»
         for start, end in _numbers(norm):
@@ -598,8 +671,28 @@ def find_prices(lines, source="auto"):
                     at = (at[0], cents_end)             # копейки — в рамку цены
                 marks[side] = {"token": token, "codes": codes, "code": resolved,
                                "weak": is_weak, "at": at, "glued": glued}
+            # Знака у числа нет ни с одной стороны, а число стоит у края строки —
+            # слово валюты могло уехать на соседнюю строку: «90 / cents.».
+            # Рамка цены остаётся на числе, а слово на той строке сотрёт render.
+            wrap, extra = {}, []
+            if not marks and not pre and not post:
+                for side, j, edge in (("post", below.get(li), not norm[post_at:].strip()),
+                                      ("pre", above.get(li), not norm[:start].strip())):
+                    hit = edge and j is not None and _wrapped_mark(norms, j, side)
+                    if not hit:
+                        continue
+                    token, (a, b) = hit
+                    codes, _ = MARKERS[(token, side)]
+                    resolved = _resolve(codes, False, source, context)
+                    at = (post_at, post_at) if side == "post" else (start, start)
+                    marks[side] = {"token": token, "codes": codes, "code": resolved,
+                                   "weak": False, "at": at, "glued": False}
+                    wrap[side] = token
+                    extra.append(_span_box(lines[j], texts[j][1], a, b)[0])
+                    break
             nums.append({"start": start, "end": end, "after": after, "post_at": post_at,
-                         "mult": mult, "marks": marks, "word": word, "raw": raw})
+                         "mult": mult, "marks": marks, "word": word, "raw": raw,
+                         "wrap": wrap, "extra": extra})
 
         # Знак между двумя числами — одного из них, а не обоих: иначе «2499 $14.99»
         # давало две цены в долларах, а у «999 ₽ 1 299 ₽» рамка второй цены
@@ -672,8 +765,14 @@ def find_prices(lines, source="auto"):
                 continue
             if mult:
                 value *= mult[0]
+            # «78 cents»: сумма — в сотых долях валюты
+            scale = 0.01 if pick and pick[1]["token"] in SUBUNITS else 1
+            # знак с соседней строки — в подпись: в списке «90 cents», а не «90»
+            label = " ".join(filter(None, (num["wrap"].get("pre"), text[span0:span1].strip(),
+                                           num["wrap"].get("post"))))
             items.append({"start": start, "end": end, "span": (span0, span1), "code": code,
-                          "weak": weak, "value": value, "raw": raw, "short": bool(mult)})
+                          "weak": weak, "value": value, "raw": raw, "short": bool(mult),
+                          "scale": scale, "label": label, "extra": num["extra"]})
 
         # Числа без знака. «от 1 500 до 3 000 ₽», «$10–20»: знак один на двоих,
         # и безымянное число берёт его у соседа. Если сосед по величине совсем
@@ -689,7 +788,7 @@ def find_prices(lines, source="auto"):
                 ratio = it["value"] / items[j]["value"] if items[j]["value"] else 0
                 if _RANGE_LINK.match(between) and 0.05 <= ratio <= 20 \
                         and not _NOT_PRICE_BEFORE.search(norm[:it["start"]]):
-                    it["code"] = items[j]["code"]
+                    it["code"], it["scale"] = items[j]["code"], items[j]["scale"]
                     break
             # валюта на экране выбрана вручную — безымянное число, похожее на
             # цену, считается в ней
@@ -697,7 +796,20 @@ def find_prices(lines, source="auto"):
                     and _looks_like_price(norm, it["start"], it["end"], it["value"]):
                 it["code"], it["weak"] = source, True
 
+        # «1 dollar 50 cents», «99 руб. 90 коп.» — одна цена, а не две
+        for i in range(len(items) - 1, 0, -1):
+            a, b = items[i - 1], items[i]
+            if b["scale"] < 1 <= a["scale"] and a["code"] and a["code"] == b["code"] \
+                    and a["value"] == int(a["value"]) and b["value"] < 100 \
+                    and _SUBUNIT_LINK.match(norm[a["span"][1]:b["span"][0]]):
+                a["value"] += b["value"] * b["scale"]
+                a["label"] += text[a["span"][1]:b["span"][0]] + b["label"]
+                a["span"] = (a["span"][0], b["span"][1])
+                a["extra"] = a["extra"] + b["extra"]
+                del items[i]
+
         for it in items:
+            it["value"] *= it["scale"]
             if not it["code"] or it["value"] <= 0:
                 continue
             # зачёркнутая цена, цифры которой с картинкой не сошлись (_check_struck)
@@ -705,9 +817,10 @@ def find_prices(lines, source="auto"):
                 continue
             span0, span1 = it["span"]
             box, strike, digits_x = _span_box(line, spans, span0, span1)
-            price = Price(it["value"], it["code"], text[span0:span1].strip(), box,
+            price = Price(it["value"], it["code"], it["label"], box,
                           strike, it["weak"], it["short"])
             price.digits_x = digits_x
+            price.extra = it["extra"]
             found.append(price)
     return found
 
@@ -2729,7 +2842,30 @@ def load_rates(cache_path, log=lambda *a: None, timeout=6):
 NBSP = "\u00a0"
 
 
-def fmt_amount(value, code, comma=True, short=None):
+def parse_amount(text, source="auto"):
+    """Сумма, набранная в конвертере: «1 299,99», «$0.78», «78 cents» -> (сумма, код или None).
+
+    Число без знака — просто число. Со знаком или словом валюты разбираем тем
+    же find_prices, что и цены на снимке, и отдаём валюту: «₹450», вставленное
+    из чата, само переключает валюту слева. `source` — выбранная валюта: по ней
+    решается спорный знак («$» при выбранном SGD — сингапурский). Не сумма — None.
+    """
+    s = " ".join(str(text or "").translate(_NORM).split())
+    if not s:
+        return None
+    try:
+        if _NUM.fullmatch(s):
+            return _parse_number(s), None
+    except ValueError:
+        pass
+    words = [{"text": t, "box": (0, 0, 1, 1), "conf": 100} for t in s.split()]
+    prices = find_prices([words], source)
+    if prices:
+        return prices[0].amount, prices[0].code
+    return None
+
+
+def fmt_amount(value, code, comma=True, short=None, exact=False):
     """8794.6, RUB -> «8 795 ₽»; 117.23, USD -> «$117»; 41.5, USD -> «$41,50».
 
     До целых округляем всё от сотни: копейки у суммы в тысячи рублей только
@@ -2738,8 +2874,19 @@ def fmt_amount(value, code, comma=True, short=None):
 
     `short` — слова для тысяч, миллионов, миллиардов на языке интерфейса:
     («тыс.», «млн», «млрд»). Передают его для цен, записанных коротко.
+
+    `exact` — для конвертера: копейки у любой суммы, сколько их у валюты
+    («8 392,15 ₽»), у криптовалют — до восьми знаков без хвостовых нулей.
     """
     sym, prefix, decimals = CURRENCIES.get(code, (code, False, 2))[:3]
+    if exact:
+        text = f"{value:,.{decimals}f}"
+        if decimals > 3 and "." in text:
+            text = text.rstrip("0").rstrip(".")
+        text = text.replace(",", NBSP)
+        if comma:
+            text = text.replace(".", ",")
+        return f"{sym}{text}" if prefix else f"{text}{NBSP}{sym}"
     if short and abs(value) >= 1e6:
         # «$1.2M» -> «101,2 млн ₽», а не «101 209 680 ₽»: раз оригинал записан
         # коротко, точность до рубля там никому не нужна
@@ -2874,6 +3021,15 @@ def render(img, prices, labels, lines, zoom=1.0, min_font=8):
 
     words = [dict(w, box=z(w["box"])) for line in lines for w in line]
     items = [(z(p.box), p, label) for p, label in zip(prices, labels) if label]
+    # Слово валюты, которое перенос строки оторвал от числа: сумма встаёт на
+    # место «90», а «cents.» на следующей строке стираем — «75 ₽ / cents.»
+    # читалось бы как рубли-центы
+    for _, p, _ in items:
+        for box in p.extra:
+            x0, y0, x1, y1 = z(box)
+            bg = _colors(src.crop((max(0, x0 - 2), max(0, y0 - 2),
+                                   min(src.width, x1 + 2), min(src.height, y1 + 2))))[0]
+            draw.rectangle((x0 - 1, y0 - 2, x1 + 1, y1 + 2), fill=bg)
     # строки: цены, перекрывающиеся по высоте
     rows = []
     for item in sorted(items, key=lambda it: (it[0][1], it[0][0])):

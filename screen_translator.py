@@ -9,6 +9,7 @@ Screen Translator — экранный переводчик в стиле Google
     Ctrl+Alt+Z  — выделить область и перевести
     Ctrl+Alt+X  — перевести текст из буфера обмена
     Ctrl+Alt+D  — выделить область и пересчитать цены в другие валюты (currency.py)
+    Ctrl+Alt+K  — конвертер валют: ввести сумму руками
     Esc         — закрыть выделение / окно перевода
 """
 
@@ -132,6 +133,7 @@ DEFAULT_CONFIG = {
     "hotkey_capture": "<ctrl>+<alt>+z",
     "hotkey_clipboard": "<ctrl>+<alt>+x",
     "hotkey_currency": "<ctrl>+<alt>+d",
+    "hotkey_converter": "<ctrl>+<alt>+k",
     "target_lang": "ru",
     "translator": "free",       # "free" — публичные точки Google; "deepl"; "google_api"
     "api_key": "",              # ключ для платного сервиса; берётся в его личном кабинете
@@ -171,6 +173,9 @@ DEFAULT_CONFIG = {
     # --- пересчёт цен (Ctrl+Alt+D), см. currency.py
     "currency_targets": [],        # в какие валюты; пусто — по языку перевода (₽ и $)
     "currency_source": "auto",     # валюта на экране: "auto" — по знаку у цены, иначе код
+    # --- конвертер валют (Ctrl+Alt+K): из какой в какую; пусто — $ и валюта языка
+    "converter_from": "",
+    "converter_to": "",
 }
 
 
@@ -977,6 +982,19 @@ UI_STRINGS = {
     "cur_thousand":  ("тыс.", "K"),
     "cur_million":   ("млн", "M"),
     "cur_billion":   ("млрд", "B"),
+    # --- конвертер валют
+    "menu_converter": ("Конвертер валют", "Currency converter"),
+    "conv_amount_tip": ("Сумма. Можно вставить прямо из чата: «$0.78», «78 cents», «₹450» — "
+                        "валюта переключится сама",
+                        "Amount. You can paste it straight from a chat: «$0.78», «78 cents», "
+                        "«₹450» — the currency switches by itself"),
+    "conv_pick":     ("Выбрать валюту", "Pick a currency"),
+    "conv_swap":     ("Поменять валюты местами", "Swap the currencies"),
+    "conv_copy_tip": ("Щёлкните, чтобы скопировать", "Click to copy"),
+    "conv_keys":     ("Enter — скопировать и закрыть · Esc — закрыть",
+                      "Enter — copy and close · Esc — close"),
+    "conv_loading":  ("Загружаю курсы…", "Loading rates…"),
+    "conv_copied":   ("Скопировано", "Copied"),
 }
 
 # Названия валют — такие же надписи, как названия языков: на других языках
@@ -5150,6 +5168,46 @@ NAV_KEYS = {"Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
 KEY_A, KEY_C, KEY_INSERT = 65, 67, 45
 
 
+def choice_popup(parent, codes, current, title, choose, anchor, per_col=12):
+    """Выпадающий список у кнопки: языки в окне перевода, валюты там и в конвертере.
+
+    `per_col` — сколько строк в колонке: длинный список кладём в колонки.
+    """
+    c = theme()
+    top = tk.Toplevel(parent)
+    top.overrideredirect(True)
+    top.attributes("-topmost", True)
+    top.configure(bg=c["line"])                  # рамка в один пиксель
+    frame = tk.Frame(top, bg=c["bg"])
+    frame.pack(padx=1, pady=1)
+
+    for i, code in enumerate(codes):
+        active = code == current
+        cell = tk.Label(frame, text=title(code), anchor="w",
+                        bg=c["active"] if active else c["bg"],
+                        fg=c["active_fg"] if active else c["btn"],
+                        font=("Segoe UI", 10), padx=14, pady=4, cursor="hand2")
+        cell.grid(row=i % per_col, column=i // per_col, sticky="ew")
+        cell.bind("<Enter>", lambda e, w=cell: w.configure(bg=c["hover_active"]))
+        cell.bind("<Leave>", lambda e, w=cell, a=active:
+                  w.configure(bg=c["active"] if a else c["bg"]))
+        cell.bind("<Button-1>", lambda e, code=code: (top.destroy(),
+                                                      choose(code)))
+
+    top.update_idletasks()
+    x = anchor.winfo_rootx() if anchor else parent.winfo_rootx()
+    y = (anchor.winfo_rooty() if anchor else parent.winfo_rooty()) - top.winfo_height() - 4
+    mx, my, mw, mh = monitor_rect_at(x, y)
+    x = min(max(x, mx + 2), max(mx + 2, mx + mw - top.winfo_width() - 2))
+    if y < my + 2:                               # не влезло сверху — покажем снизу
+        y = (anchor.winfo_rooty() + anchor.winfo_height() + 4) if anchor else my + 2
+    top.geometry("+%d+%d" % (int(x), int(y)))
+    top.bind("<Escape>", lambda e: top.destroy())
+    top.bind("<FocusOut>", lambda e: top.destroy())
+    top.focus_force()
+    return top
+
+
 class ResultWindow:
     """Окно поверх всех: либо картинка с наложенным переводом, либо текстовая панель."""
 
@@ -5788,42 +5846,8 @@ class ResultWindow:
                     lang_title, self.set_source, self.source_btn)
 
     def _popup(self, codes, current, title, choose, anchor, per_col=12):
-        """Выпадающий список под кнопкой — общий для обоих выборов языка.
-
-        `per_col` — сколько строк в колонке: длинный список кладём в колонки.
-        """
-        c = theme()
-        top = tk.Toplevel(self.win)
-        top.overrideredirect(True)
-        top.attributes("-topmost", True)
-        top.configure(bg=c["line"])                  # рамка в один пиксель
-        frame = tk.Frame(top, bg=c["bg"])
-        frame.pack(padx=1, pady=1)
-
-        for i, code in enumerate(codes):
-            active = code == current
-            cell = tk.Label(frame, text=title(code), anchor="w",
-                            bg=c["active"] if active else c["bg"],
-                            fg=c["active_fg"] if active else c["btn"],
-                            font=("Segoe UI", 10), padx=14, pady=4, cursor="hand2")
-            cell.grid(row=i % per_col, column=i // per_col, sticky="ew")
-            cell.bind("<Enter>", lambda e, w=cell: w.configure(bg=c["hover_active"]))
-            cell.bind("<Leave>", lambda e, w=cell, a=active:
-                      w.configure(bg=c["active"] if a else c["bg"]))
-            cell.bind("<Button-1>", lambda e, code=code: (top.destroy(),
-                                                          choose(code)))
-
-        top.update_idletasks()
-        x = anchor.winfo_rootx() if anchor else self.win.winfo_rootx()
-        y = (anchor.winfo_rooty() if anchor else self.win.winfo_rooty()) - top.winfo_height() - 4
-        mx, my, mw, mh = monitor_rect_at(x, y)
-        x = min(max(x, mx + 2), max(mx + 2, mx + mw - top.winfo_width() - 2))
-        if y < my + 2:                               # не влезло сверху — покажем снизу
-            y = (anchor.winfo_rooty() + anchor.winfo_height() + 4) if anchor else my + 2
-        top.geometry("+%d+%d" % (int(x), int(y)))
-        top.bind("<Escape>", lambda e: top.destroy())
-        top.bind("<FocusOut>", lambda e: top.destroy())
-        top.focus_force()
+        """Выпадающий список под кнопкой — общий для обоих выборов языка."""
+        choice_popup(self.win, codes, current, title, choose, anchor, per_col)
 
     def set_source(self, code):
         """Меняем язык на экране и пересчитываем тот же снимок заново.
@@ -6530,6 +6554,255 @@ class PriceSnapshot:
         return f'{tr("cur_cbr_short")} · {day}' if kind == "cbr" else day
 
 
+class ConverterWindow:
+    """Конвертер валют вручную — своя клавиша, по умолчанию Ctrl+Alt+K.
+
+    Вызвал, ввёл сумму, увидел, закрыл: слева сумма и её валюта, справа — та же
+    сумма в другой валюте, пересчёт на каждое нажатие клавиши. Курсы и разбор
+    сумм те же, что у пересчёта цен со снимка (currency.py), поэтому сумму
+    можно вставить прямо из чата: «78 cents», «₹450» — валюта слева
+    переключится по знаку сама.
+
+    Окно одно: повторное нажатие клавиши поднимает уже открытое.
+    """
+
+    current = None          # открытое окно
+    last_amount = "100"     # что вводили в прошлый раз — живёт до выхода из программы
+
+    @classmethod
+    def show(cls, root, post, save, flash):
+        if cls.current is not None:
+            try:
+                cls.current.raise_up()
+                return
+            except tk.TclError:
+                cls.current = None
+        cls.current = cls(root, post, save, flash)
+
+    def __init__(self, root, post, save, flash):
+        self.root, self.post, self.save, self.flash = root, post, save, flash
+        self.rates, self.error, self.result = None, "", ""
+        # по умолчанию — из доллара в валюту языка перевода (у английского — из евро в доллар)
+        home, other = currency.default_targets(CFG.get("target_lang", "ru"))
+        self.src = self._saved("converter_from", other)
+        self.dst = self._saved("converter_to", home)
+        amount = ConverterWindow.last_amount
+        # Скопированная сумма со знаком валюты — сразу её: скопировал «₹450»
+        # в чате, нажал клавишу — и ответ уже на экране
+        try:
+            clip = root.clipboard_get()
+        except Exception:
+            clip = ""
+        if 0 < len(clip.strip()) <= 40:
+            parsed = currency.parse_amount(clip, self.src)
+            if parsed and parsed[1]:
+                amount = clip.strip()
+
+        c = theme()
+        self.win = win = tk.Toplevel(root)
+        win.title(tr("menu_converter"))
+        win.configure(bg=c["bg"])
+        win.attributes("-topmost", True)
+        win.resizable(False, False)
+        win.protocol("WM_DELETE_WINDOW", self.close)
+
+        body = tk.Frame(win, bg=c["bg"])
+        body.pack(padx=18, pady=(16, 4))
+        big = ("Segoe UI", 16)
+        self.var = tk.StringVar(value=amount)
+        self.entry = tk.Entry(body, textvariable=self.var, width=14, bg=c["entry"], fg=c["fg"],
+                              insertbackground=c["fg"], relief="flat", font=big,
+                              highlightthickness=1, highlightbackground=c["line"],
+                              highlightcolor=c["accent"])
+        self.entry.grid(row=0, column=0, ipady=3, sticky="ns")
+        Tooltip(self.entry, tr("conv_amount_tip"))
+        self.src_btn = self._button(body, self._pick_src)
+        self.src_btn.grid(row=0, column=1, padx=(6, 0), sticky="ns")
+        swap = tk.Label(body, text="⇄", bg=c["bg"], fg=c["btn"], font=("Segoe UI", 16),
+                        padx=12, cursor="hand2")
+        swap.grid(row=0, column=2)
+        swap.bind("<Button-1>", lambda e: self._swap())
+        swap.bind("<Enter>", lambda e: swap.configure(fg=c["accent"]))
+        swap.bind("<Leave>", lambda e: swap.configure(fg=c["btn"]))
+        Tooltip(swap, tr("conv_swap"))
+        # результат — с той же рамкой, что у поля, чтобы читался как пара к нему
+        self.out = tk.Label(body, text="", width=14, anchor="w", bg=c["entry"], fg=c["fg"],
+                            font=("Segoe UI Semibold", 16), padx=4, cursor="hand2",
+                            highlightthickness=1, highlightbackground=c["line"])
+        self.out.grid(row=0, column=3, sticky="ns")
+        self.out.bind("<Button-1>", lambda e: self._copy())
+        Tooltip(self.out, tr("conv_copy_tip"))
+        self.dst_btn = self._button(body, self._pick_dst)
+        self.dst_btn.grid(row=0, column=4, padx=(6, 0), sticky="ns")
+        small = ("Segoe UI", 9)
+        self.src_name = tk.Label(body, bg=c["bg"], fg=c["dim"], font=small, anchor="w")
+        self.src_name.grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+        self.dst_name = tk.Label(body, bg=c["bg"], fg=c["dim"], font=small, anchor="w")
+        self.dst_name.grid(row=1, column=3, columnspan=2, sticky="w", pady=(3, 0))
+        self.rate = tk.Label(win, bg=c["bg"], fg=c["dim"], font=small, anchor="w",
+                             justify="left")
+        self.rate.pack(fill="x", padx=18, pady=(8, 0))
+        tk.Label(win, text=tr("conv_keys"), bg=c["bg"], fg=c["faint"], font=small,
+                 anchor="w").pack(fill="x", padx=18, pady=(2, 14))
+
+        self.var.trace_add("write", lambda *_: self.update())
+        win.bind("<Return>", lambda e: self._copy(close=True))
+        win.bind("<KP_Enter>", lambda e: self._copy(close=True))
+        win.bind("<Escape>", lambda e: self.close())
+        self.update()
+
+        win.update_idletasks()
+        mx, my, mw, mh = monitor_rect_at(win.winfo_pointerx(), win.winfo_pointery())
+        win.geometry("+%d+%d" % (mx + (mw - win.winfo_width()) // 2,
+                                 my + (mh - win.winfo_height()) // 3))
+        self.raise_up()
+        threading.Thread(target=self._load, daemon=True).start()
+
+    @staticmethod
+    def _saved(name, fallback):
+        code = str(CFG.get(name, "") or "")
+        return code if code in currency.CURRENCIES else fallback
+
+    def _button(self, parent, command):
+        c = theme()
+        b = tk.Label(parent, bg=c["bar"], fg=c["btn"], font=("Segoe UI", 11), padx=10,
+                     cursor="hand2")
+        b.bind("<Button-1>", lambda e: command())
+        b.bind("<Enter>", lambda e: b.configure(bg=c["hover"]))
+        b.bind("<Leave>", lambda e: b.configure(bg=c["bar"]))
+        Tooltip(b, tr("conv_pick"))
+        return b
+
+    def raise_up(self):
+        self.win.deiconify()
+        self.win.lift()
+        self.win.focus_force()
+        self.entry.focus_set()
+        self.entry.select_range(0, "end")
+        self.entry.icursor("end")
+
+    def _load(self):
+        """Курсы — в фоне: кэш отдаётся сразу, а скачивание идёт до шести секунд."""
+        rates, error = None, ""
+        try:
+            rates = currency.load_rates(RATES_PATH, log=log)
+        except currency.RatesUnavailable:
+            error = tr("cur_offline")
+        except Exception as e:
+            traceback.print_exc()
+            error = f'{tr("error")}: {e}'
+        self.post(self._loaded, rates, error)
+
+    def _loaded(self, rates, error):
+        if ConverterWindow.current is not self:     # окно уже закрыли
+            return
+        self.rates, self.error = rates, error
+        self.update()
+
+    def update(self):
+        ConverterWindow.last_amount = self.var.get()
+        parsed = currency.parse_amount(self.var.get(), self.src)
+        # «₹450», «78 cents» — валюта слева по знаку
+        if parsed and parsed[1] and parsed[1] != self.src:
+            self.src = parsed[1]
+            self.save("converter_from", self.src)
+        for btn, name, code in ((self.src_btn, self.src_name, self.src),
+                                (self.dst_btn, self.dst_name, self.dst)):
+            btn.configure(text=f"{code} ▾")
+            name.configure(text=tr(f"cur_{code}"))
+        comma = ui_lang().split("-")[0] in COMMA_LANGS
+        self.result = ""
+        if self.error:
+            self.out.configure(text="—")
+            self.rate.configure(text=self.error)
+            return
+        if self.rates is None:
+            self.out.configure(text="…")
+            self.rate.configure(text=tr("conv_loading"))
+            return
+        if not (self.rates.has(self.src) and self.rates.has(self.dst)):
+            shown = tr("cur_no_rate")
+        elif parsed:
+            value = self.rates.convert(parsed[0], self.src, self.dst)
+            shown = self.result = currency.fmt_amount(value, self.dst, comma, exact=True)
+        else:
+            shown = "—"             # поле пустое или в нём не сумма
+        self.out.configure(text=shown)
+        self.rate.configure(text=self._rate_text(comma))
+
+    def _rate_text(self, comma):
+        """«1 USD = 83,9215 ₽ · Курс ЦБ РФ на 13.10.2026».
+
+        Рубль слева не пишем — «1 RUB = $0,0119» читать непривычно: при
+        рублях показываем курс другой валюты к рублю, как его даёт ЦБ.
+        """
+        r = self.rates
+        left, right = (self.dst, self.src) if self.src == "RUB" else (self.src, self.dst)
+        if left == right:
+            return ""
+        one = r.convert(1, left, right)
+        if one is None:
+            return tr("cur_no_rate")
+        kinds = {r.source.get(code) for code in (left, right) if code != "RUB"}
+        if "fb" in kinds and r.fb_date:
+            note = f'{tr("cur_fb")} {_dmy(r.fb_date)}'
+        elif r.cbr_date:
+            note = f'{tr("cur_cbr")} {r.cbr_date}'
+        else:
+            note = ""
+        text = f"1 {left} = {currency.fmt_rate(one, right, comma)}" + (f" · {note}" if note else "")
+        return text + ("\n" + tr("cur_stale") if r.stale else "")
+
+    def _pick(self, current, anchor, choose):
+        choice_popup(self.win, currency.CHOICES, current, currency_title, choose, anchor,
+                     per_col=16)
+
+    def _pick_src(self):
+        self._pick(self.src, self.src_btn, lambda code: self._set("src", code))
+
+    def _pick_dst(self):
+        self._pick(self.dst, self.dst_btn, lambda code: self._set("dst", code))
+
+    def _set(self, side, code):
+        setattr(self, side, code)
+        self.save("converter_from" if side == "src" else "converter_to", code)
+        self.update()
+        self.raise_up()
+
+    def _swap(self):
+        """Поменять валюты местами; сумма справа переезжает в поле слева."""
+        amount = self.result
+        self.src, self.dst = self.dst, self.src
+        self.save("converter_from", self.src)
+        self.save("converter_to", self.dst)
+        if amount:
+            # без знака: со знаком «$» разбор отдал бы валюту по знаку, а она и так своя
+            sym = currency.symbol(self.src)
+            self.var.set(amount.replace(sym, "").replace(currency.NBSP, " ").strip())
+        self.update()
+        self.raise_up()
+
+    def _copy(self, close=False):
+        if self.result:
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(self.result)
+                self.root.update()
+                self.flash(f'{tr("conv_copied")}: {self.result}')
+            except Exception:
+                traceback.print_exc()
+        if close:
+            self.close()
+
+    def close(self):
+        if ConverterWindow.current is self:
+            ConverterWindow.current = None
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
 # --------------------------------------------------------------------------------------
 #  Приложение
 # --------------------------------------------------------------------------------------
@@ -6788,6 +7061,11 @@ class App:
         ResultWindow(self.root, screen_xy, image=image, translated=text, original="",
                      rerender=draw, on_theme=self._set_theme, post=self.post, prices=snap)
 
+    # --- сценарий 4: конвертер валют — сумма руками, без снимка
+    def open_converter(self):
+        refresh_config()
+        ConverterWindow.show(self.root, self.post, self._save_setting, self._flash)
+
     def _flash(self, message, seconds=2.2):
         """Короткое сообщение, которое само исчезает."""
         toast = Toast(self.root, message)
@@ -6873,6 +7151,7 @@ class App:
             CFG.get("hotkey_capture", "<ctrl>+<alt>+z"): lambda: self.post(self.start_capture),
             CFG.get("hotkey_clipboard", "<ctrl>+<alt>+x"): lambda: self.post(self.translate_clipboard),
             CFG.get("hotkey_currency", "<ctrl>+<alt>+d"): lambda: self.post(self.start_currency),
+            CFG.get("hotkey_converter", "<ctrl>+<alt>+k"): lambda: self.post(self.open_converter),
         }
         if sys.platform == "win32":
             self.hotkeys = register_global_hotkeys(mapping, on_fail=self._hotkeys_failed)
@@ -6931,6 +7210,9 @@ class App:
             pystray.MenuItem(
                 lambda _: f'{tr("menu_currency")} ({self._pretty(CFG["hotkey_currency"])})',
                 lambda: self.post(self.start_currency)),
+            pystray.MenuItem(
+                lambda _: f'{tr("menu_converter")} ({self._pretty(CFG["hotkey_converter"])})',
+                lambda: self.post(self.open_converter)),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem(lambda _: tr("target_set"), self._target_menu(pystray)),
             pystray.MenuItem(lambda _: tr("ocr_set"), self._lang_menu(pystray)),
@@ -7189,7 +7471,7 @@ class App:
                  font=("Segoe UI", 9)).pack(padx=18, anchor="w")
 
         actions = (("hotkey_capture", "menu_capture"), ("hotkey_clipboard", "menu_clip"),
-                   ("hotkey_currency", "menu_currency"))
+                   ("hotkey_currency", "menu_currency"), ("hotkey_converter", "menu_converter"))
         picked = {name: str(CFG.get(name, DEFAULT_CONFIG[name])) for name, _ in actions}
         ours = set(picked.values())     # эти держим мы сами, на занятость не проверяем
         boxes, recording, held = {}, {"name": None}, set()
@@ -7380,6 +7662,7 @@ class App:
         print(f"  {self._pretty(CFG['hotkey_capture'])} — выделить область и перевести")
         print(f"  {self._pretty(CFG['hotkey_clipboard'])} — перевести буфер обмена")
         print(f"  {self._pretty(CFG['hotkey_currency'])} — выделить область и пересчитать цены")
+        print(f"  {self._pretty(CFG['hotkey_converter'])} — конвертер валют")
         print("  Выход — через иконку в трее или Ctrl+C в этом окне.")
         load_promo()
         fetch_promo()
